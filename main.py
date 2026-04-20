@@ -6,8 +6,12 @@ import os
 from datetime import datetime
 import pytz
 from alpaca.trading.client import TradingClient
-from alpaca.trading.requests import MarketOrderRequest
-from alpaca.trading.enums import OrderSide, TimeInForce
+from alpaca.trading.requests import (
+    MarketOrderRequest,
+    StopLossRequest,
+    TakeProfitRequest
+)
+from alpaca.trading.enums import OrderSide, TimeInForce, OrderClass
 
 # ═══════════════════════════════════════════════════════════════
 #  CONNEXION ALPACA PAPER TRADING
@@ -28,17 +32,13 @@ print(f"📊 Valeur portefeuille : {float(account.portfolio_value):.2f}$")
 # ═══════════════════════════════════════════════════════════════
 
 CAPITAL_TOTAL      = float(account.cash)
-RISQUE_PAR_TRADE   = 0.02       # 2% du capital par trade
-MAX_POSITIONS      = 6          # ✅ 6 positions max simultanées
+RISQUE_PAR_TRADE   = 0.02
+MAX_POSITIONS      = 6
 ATR_MULTIPLICATEUR = 1.5
-TP1_PCT  = 0.04                 # ✅ +4%
-TP2_PCT  = 0.08                 # ✅ +8%
-TP3_PCT  = 0.15                 # ✅ +15%
-SL_SECURISE = 0.005
-TZ_PARIS = pytz.timezone("Europe/Paris")
+TZ_PARIS           = pytz.timezone("Europe/Paris")
 
 # ═══════════════════════════════════════════════════════════════
-#  UNIVERS ÉLARGI — 25 ACTIFS HALAL
+#  UNIVERS — 25 ACTIFS HALAL
 # ═══════════════════════════════════════════════════════════════
 
 matieres_premieres = {
@@ -77,7 +77,7 @@ def calcul_atr(df, periode=14):
     df["H-L"]  = df["High"] - df["Low"]
     df["H-CP"] = abs(df["High"] - df["Close"].shift(1))
     df["L-CP"] = abs(df["Low"]  - df["Close"].shift(1))
-    df["TR"]   = df[["H-L", "H-CP", "L-CP"]].max(axis=1)
+    df["TR"]   = df[["H-L","H-CP","L-CP"]].max(axis=1)
     df["ATR"]  = df["TR"].rolling(periode).mean()
     return df
 
@@ -97,10 +97,10 @@ def calcul_rsi(df, periode=14):
     return df
 
 def calcul_macd(df):
-    ema12            = df["Close"].ewm(span=12).mean()
-    ema26            = df["Close"].ewm(span=26).mean()
-    df["MACD"]       = ema12 - ema26
-    df["Signal_MACD"]= df["MACD"].ewm(span=9).mean()
+    ema12             = df["Close"].ewm(span=12).mean()
+    ema26             = df["Close"].ewm(span=26).mean()
+    df["MACD"]        = ema12 - ema26
+    df["Signal_MACD"] = df["MACD"].ewm(span=9).mean()
     return df
 
 def calcul_zones(df, periode=20):
@@ -114,13 +114,13 @@ def calcul_zones(df, periode=20):
 def calcul_tendance(ticker):
     for tentative in range(3):
         try:
-            df_w = yf.download(ticker, period="3mo", interval="1d",
+            df_d = yf.download(ticker, period="3mo", interval="1d",
                                auto_adjust=True, progress=False)
-            if df_w is None or len(df_w) < 20:
+            if df_d is None or len(df_d) < 20:
                 return "NEUTRE"
-            df_w.columns = df_w.columns.get_level_values(0)
-            df_w["MA20"] = df_w["Close"].rolling(20).mean()
-            last  = df_w.iloc[-1]
+            df_d.columns = df_d.columns.get_level_values(0)
+            df_d["MA20"] = df_d["Close"].rolling(20).mean()
+            last  = df_d.iloc[-1]
             close = float(last["Close"])
             ma20  = float(last["MA20"])
             if close > ma20 * 1.01:
@@ -151,10 +151,10 @@ def telecharger_donnees(ticker, period="5d", interval="15m"):
     return None
 
 # ═══════════════════════════════════════════════════════════════
-#  3 TYPES DE SIGNAUX — SCORE MINIMUM 4/6
+#  SIGNAUX ACHAT — 3 types, score min 4/6
 # ═══════════════════════════════════════════════════════════════
 
-def analyser_signal(ticker):
+def analyser_signal_achat(ticker):
     df = telecharger_donnees(ticker)
     if df is None:
         return None
@@ -186,8 +186,7 @@ def analyser_signal(ticker):
     zone_mid  = float(d["Zone_Mid"])
 
     vol_moyen  = df["Volume"].rolling(20).mean().iloc[-1]
-    vol_actuel = float(d["Volume"])
-    vol_ok     = vol_actuel > vol_moyen * 1.0
+    vol_ok     = float(d["Volume"]) > vol_moyen
 
     tendance    = calcul_tendance(ticker)
     tendance_ok = tendance in ["HAUSSE", "NEUTRE"]
@@ -195,72 +194,166 @@ def analyser_signal(ticker):
     signal_type = None
     score = 0
 
-    # ─── SIGNAL A : Rebond zone basse Belkhayat ───────────────
+    # SIGNAL A : Rebond zone basse Belkhayat
     if prix <= zone_b * 1.015 and k < 30 and d_val < 35 and tendance_ok:
         signal_type = "REBOND_ZONE_BASSE"
         score = 3
-        if vol_ok:          score += 1
-        if k > k_prev:      score += 1  # stoch remonte
-        if rsi < 40:        score += 1
+        if vol_ok:      score += 1
+        if k > k_prev:  score += 1
+        if rsi < 40:    score += 1
 
-    # ─── SIGNAL B : Croisement MACD haussier ──────────────────
+    # SIGNAL B : Croisement MACD haussier
     elif (macd > macd_sig and macd_prev <= sig_prev
           and rsi > 35 and rsi < 65 and tendance_ok):
         signal_type = "CROISEMENT_MACD"
         score = 3
-        if vol_ok:              score += 1
-        if prix < zone_mid:     score += 1
-        if k < 60:              score += 1
+        if vol_ok:          score += 1
+        if prix < zone_mid: score += 1
+        if k < 60:          score += 1
 
-    # ─── SIGNAL C : RSI survendu + retournement stoch ─────────
+    # SIGNAL C : RSI survendu + retournement stoch
     elif rsi < 35 and k > k_prev and k < 45 and tendance_ok and vol_ok:
         signal_type = "RSI_SURVENDU"
         score = 3
-        if prix <= zone_b * 1.02:   score += 1
-        if macd > macd_prev:        score += 1
-        if k > d_val:               score += 1
+        if prix <= zone_b * 1.02: score += 1
+        if macd > macd_prev:      score += 1
+        if k > d_val:             score += 1
 
     if signal_type is None or score < 4:
         return None
 
     capital_trade = CAPITAL_TOTAL * RISQUE_PAR_TRADE
     quantite      = max(1, int(capital_trade / prix))
+    sl            = round(prix - (atr * ATR_MULTIPLICATEUR), 2)
 
     return {
         "ticker":      ticker,
         "prix":        prix,
         "signal_type": signal_type,
         "score":       score,
-        "sl":          round(prix - (atr * ATR_MULTIPLICATEUR), 4),
-        "tp1":         round(prix * (1 + TP1_PCT), 4),
-        "tp2":         round(prix * (1 + TP2_PCT), 4),
-        "tp3":         round(prix * (1 + TP3_PCT), 4),
+        "sl":          sl,
         "quantite":    quantite,
         "capital":     round(quantite * prix, 2),
     }
+
+# ═══════════════════════════════════════════════════════════════
+#  SIGNAUX VENTE — le robot vend UNIQUEMENT sur signal de vente
+# ═══════════════════════════════════════════════════════════════
+
+def analyser_signal_vente(ticker, prix_entree):
+    """
+    3 signaux de vente — opposés aux signaux d'achat :
+    A : Prix en zone HAUTE Belkhayat + stoch suracheté
+    B : Croisement MACD baissier
+    C : RSI suracheté + stoch qui redescend
+    Score minimum 3/5 pour vendre
+    """
+    df = telecharger_donnees(ticker)
+    if df is None:
+        return False
+
+    df.columns = df.columns.get_level_values(0)
+    df = calcul_stochastique(df)
+    df = calcul_rsi(df)
+    df = calcul_macd(df)
+    df = calcul_zones(df)
+
+    if len(df) < 30:
+        return False
+
+    d   = df.iloc[-1]
+    d_1 = df.iloc[-2]
+
+    prix      = float(d["Close"])
+    k         = float(d["%K"])
+    k_prev    = float(d_1["%K"])
+    d_val     = float(d["%D"])
+    rsi       = float(d["RSI"])
+    macd      = float(d["MACD"])
+    macd_sig  = float(d["Signal_MACD"])
+    macd_prev = float(d_1["MACD"])
+    sig_prev  = float(d_1["Signal_MACD"])
+    zone_h    = float(d["Zone_Haute"])
+    zone_mid  = float(d["Zone_Mid"])
+
+    # On ne vend jamais en perte (sauf SL Alpaca)
+    # Si on est en dessous du prix d'entrée → laisser Alpaca gérer le SL
+    if prix < prix_entree:
+        return False
+
+    signal_vente = None
+    score = 0
+
+    # VENTE A : Zone haute Belkhayat + stoch suracheté
+    if prix >= zone_h * 0.985 and k > 70 and d_val > 65:
+        signal_vente = "ZONE_HAUTE"
+        score = 3
+        if k < k_prev:  score += 1   # stoch qui redescend
+        if rsi > 65:    score += 1
+
+    # VENTE B : Croisement MACD baissier
+    elif (macd < macd_sig and macd_prev >= sig_prev and rsi > 50):
+        signal_vente = "CROISEMENT_MACD_BAISSIER"
+        score = 3
+        if prix > zone_mid:  score += 1
+        if k > 60:           score += 1
+
+    # VENTE C : RSI suracheté + stoch redescend
+    elif rsi > 70 and k < k_prev and k > 55:
+        signal_vente = "RSI_SURACHETÉ"
+        score = 3
+        if prix >= zone_h * 0.97: score += 1
+        if macd < macd_prev:      score += 1
+
+    if signal_vente is None or score < 3:
+        return False
+
+    gain_pct = ((prix - prix_entree) / prix_entree) * 100
+    print(f"  🔴 SIGNAL VENTE {ticker} — {signal_vente} | Score {score}/5 | +{gain_pct:.2f}%")
+    return True
 
 # ═══════════════════════════════════════════════════════════════
 #  ORDRES ALPACA
 # ═══════════════════════════════════════════════════════════════
 
 def passer_ordre_achat(signal):
+    """Achat avec Stop Loss automatique Alpaca — pas de TP fixe"""
     try:
         ordre = MarketOrderRequest(
             symbol=signal["ticker"],
             qty=signal["quantite"],
             side=OrderSide.BUY,
-            time_in_force=TimeInForce.DAY
+            time_in_force=TimeInForce.DAY,
+            order_class=OrderClass.OTO,        # One-Triggers-Other
+            stop_loss=StopLossRequest(
+                stop_price=signal["sl"]        # SL géré par Alpaca ✅
+            )
         )
         result = client.submit_order(ordre)
-        print(f"  ✅ ACHAT {signal['ticker']} | {signal['signal_type']} | Score {signal['score']}/6")
-        print(f"     {signal['quantite']} actions x {signal['prix']:.2f}$ = {signal['capital']:.2f}$")
-        print(f"     SL: {signal['sl']:.2f}$ | TP1: {signal['tp1']:.2f}$ | TP2: {signal['tp2']:.2f}$ | TP3: {signal['tp3']:.2f}$")
+        print(f"\n  ✅ ACHAT {signal['ticker']} | {signal['signal_type']} | Score {signal['score']}/6")
+        print(f"     {signal['quantite']} x {signal['prix']:.2f}$ = {signal['capital']:.2f}$")
+        print(f"     🛑 SL automatique Alpaca : {signal['sl']:.2f}$")
+        print(f"     📈 Vente : uniquement sur signal de vente")
+        print(f"     Order ID : {result.id}")
         return result.id
     except Exception as e:
         print(f"  ❌ Erreur achat {signal['ticker']} : {e}")
-        return None
+        # Fallback ordre simple
+        try:
+            ordre_simple = MarketOrderRequest(
+                symbol=signal["ticker"],
+                qty=signal["quantite"],
+                side=OrderSide.BUY,
+                time_in_force=TimeInForce.DAY
+            )
+            result = client.submit_order(ordre_simple)
+            print(f"  ✅ Achat simple {signal['ticker']} (sans SL auto)")
+            return result.id
+        except Exception as e2:
+            print(f"  ❌ Échec total {signal['ticker']} : {e2}")
+            return None
 
-def passer_ordre_vente(ticker, quantite):
+def passer_ordre_vente(ticker, quantite, raison="SIGNAL_VENTE"):
     try:
         ordre = MarketOrderRequest(
             symbol=ticker,
@@ -269,14 +362,14 @@ def passer_ordre_vente(ticker, quantite):
             time_in_force=TimeInForce.DAY
         )
         result = client.submit_order(ordre)
-        print(f"  ✅ VENTE {quantite} x {ticker}")
+        print(f"  ✅ VENTE {quantite} x {ticker} | Raison : {raison}")
         return result.id
     except Exception as e:
         print(f"  ❌ Erreur vente {ticker} : {e}")
         return None
 
 # ═══════════════════════════════════════════════════════════════
-#  GESTION POSITIONS TP/SL PROGRESSIF
+#  GESTION POSITIONS
 # ═══════════════════════════════════════════════════════════════
 
 portefeuille = {}
@@ -293,8 +386,10 @@ def gerer_positions():
         return
 
     for ticker, pos in list(portefeuille.items()):
+
+        # Fermée par Alpaca via SL automatique
         if ticker not in positions_alpaca:
-            print(f"  ℹ️ {ticker} fermée")
+            print(f"  🛑 {ticker} fermée par SL automatique Alpaca")
             del portefeuille[ticker]
             continue
 
@@ -303,31 +398,17 @@ def gerer_positions():
         gain_pct    = ((prix_actuel - entree) / entree) * 100
         quantite    = int(positions_alpaca[ticker].qty)
 
-        print(f"  📌 {ticker} | {entree:.2f}$ → {prix_actuel:.2f}$ | {gain_pct:+.2f}%")
+        print(f"  📌 {ticker} | Entrée: {entree:.2f}$ | Actuel: {prix_actuel:.2f}$ | {gain_pct:+.2f}%")
 
-        fermer = False
-        raison = ""
-
-        if prix_actuel <= pos["sl"]:
-            fermer = True
-            raison = f"🛑 Stop Loss"
-        elif prix_actuel >= pos["tp3"]:
-            fermer = True
-            raison = f"🎉 TP3 +15% !"
-        elif prix_actuel >= pos["tp2"] and not pos.get("tp2_atteint"):
-            pos["tp2_atteint"] = True
-            pos["sl"] = pos["tp1"]
-            print(f"     ✅ TP2 +8% ! SL → {pos['tp1']:.2f}$")
-        elif prix_actuel >= pos["tp1"] and not pos.get("tp1_atteint"):
-            pos["tp1_atteint"] = True
-            pos["sl"] = round(entree * (1 + SL_SECURISE), 4)
-            print(f"     ✅ TP1 +4% ! SL sécurisé → {pos['sl']:.2f}$")
-
-        if fermer:
-            pnl = (prix_actuel - entree) * quantite
-            print(f"     {raison} | PnL: {pnl:+.2f}$")
-            passer_ordre_vente(ticker, quantite)
-            del portefeuille[ticker]
+        # Vérifier signal de vente
+        try:
+            signal_vente = analyser_signal_vente(ticker, entree)
+            if signal_vente:
+                passer_ordre_vente(ticker, quantite, "SIGNAL_VENTE")
+                del portefeuille[ticker]
+            time.sleep(3)
+        except Exception as e:
+            print(f"  ⚠️ Erreur analyse vente {ticker} : {e}")
 
 # ═══════════════════════════════════════════════════════════════
 #  HORAIRES
@@ -344,13 +425,14 @@ def est_heure_tradeable():
 # ═══════════════════════════════════════════════════════════════
 
 def lancer_robot(nb_cycles=9999, pause_minutes=15):
-    print("\n🤖 ROBOT HALAL V2 — MULTI-SIGNAUX BELKHAYAT")
+    print("\n🤖 ROBOT HALAL V4 — VENTE SUR SIGNAL UNIQUEMENT")
     print("=" * 60)
     print(f"💰 Capital       : {CAPITAL_TOTAL:.2f}$")
     print(f"🎯 Par trade     : {CAPITAL_TOTAL * RISQUE_PAR_TRADE:.2f}$ (2%)")
     print(f"📦 Max positions : {MAX_POSITIONS}")
-    print(f"📈 3 Signaux     : REBOND_ZONE_BASSE | CROISEMENT_MACD | RSI_SURVENDU")
-    print(f"🎯 TP1/2/3       : +4% / +8% / +15%")
+    print(f"📈 Achat         : 3 signaux (REBOND | MACD | RSI)")
+    print(f"📉 Vente         : sur signal de vente UNIQUEMENT")
+    print(f"🛑 Protection    : SL automatique Alpaca (si chute brutale)")
     print(f"🌍 Actifs        : {len(matieres_premieres)}")
     print(f"⏱️  Scan          : toutes les {pause_minutes} minutes")
     print("=" * 60)
@@ -373,18 +455,35 @@ def lancer_robot(nb_cycles=9999, pause_minutes=15):
         except Exception as e:
             print(f"  ⚠️ Erreur compte : {e}")
 
+        # Sync avec Alpaca — détecte SL touchés automatiquement
+        try:
+            positions_reelles = {p.symbol for p in client.get_all_positions()}
+            for ticker in list(portefeuille.keys()):
+                if ticker not in positions_reelles:
+                    print(f"  🛑 {ticker} — SL touché, fermée par Alpaca")
+                    del portefeuille[ticker]
+        except Exception as e:
+            print(f"  ⚠️ Erreur sync : {e}")
+
+        # Gérer les positions ouvertes → chercher signaux de vente
         gerer_positions()
 
+        # Chercher nouveaux signaux d'achat
         places = MAX_POSITIONS - len(portefeuille)
         if places > 0:
             print(f"\n🔍 Scan {len(matieres_premieres)} actifs ({places} place(s) dispo)...")
             signaux_trouves = []
 
+            try:
+                positions_reelles = {p.symbol for p in client.get_all_positions()}
+            except:
+                positions_reelles = set()
+
             for ticker, nom in matieres_premieres.items():
-                if ticker in portefeuille:
+                if ticker in portefeuille or ticker in positions_reelles:
                     continue
                 try:
-                    signal = analyser_signal(ticker)
+                    signal = analyser_signal_achat(ticker)
                     if signal:
                         signaux_trouves.append(signal)
                         print(f"  🚨 {ticker} ({nom}) — {signal['signal_type']} score {signal['score']}/6")
@@ -393,9 +492,8 @@ def lancer_robot(nb_cycles=9999, pause_minutes=15):
                     time.sleep(5)
                     continue
 
-            # Trier par meilleur score
             signaux_trouves.sort(key=lambda x: x["score"], reverse=True)
-            print(f"\n  📊 {len(signaux_trouves)} signal(s) trouvé(s)")
+            print(f"\n  📊 {len(signaux_trouves)} signal(s) d'achat trouvé(s)")
 
             for signal in signaux_trouves:
                 if len(portefeuille) >= MAX_POSITIONS:
@@ -408,11 +506,6 @@ def lancer_robot(nb_cycles=9999, pause_minutes=15):
                         "prix_entree": signal["prix"],
                         "quantite":    signal["quantite"],
                         "sl":          signal["sl"],
-                        "tp1":         signal["tp1"],
-                        "tp2":         signal["tp2"],
-                        "tp3":         signal["tp3"],
-                        "tp1_atteint": False,
-                        "tp2_atteint": False,
                         "order_id":    order_id,
                     }
         else:
@@ -420,7 +513,7 @@ def lancer_robot(nb_cycles=9999, pause_minutes=15):
 
         print(f"\n📊 Positions: {len(portefeuille)}/{MAX_POSITIONS}")
         for t, p in portefeuille.items():
-            print(f"   {t} | Entrée: {p['prix_entree']:.2f}$ | SL: {p['sl']:.2f}$ | TP1: {p['tp1']:.2f}$")
+            print(f"   {t} | Entrée: {p['prix_entree']:.2f}$ | SL: {p['sl']:.2f}$")
 
         print(f"\n⏳ Prochain scan dans {pause_minutes}min...")
         time.sleep(pause_minutes * 60)
