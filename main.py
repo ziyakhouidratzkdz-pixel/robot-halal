@@ -28,36 +28,45 @@ print(f"📊 Valeur portefeuille : {float(account.portfolio_value):.2f}$")
 # ═══════════════════════════════════════════════════════════════
 
 CAPITAL_TOTAL      = float(account.cash)
-RISQUE_PAR_TRADE   = 0.02
-MAX_POSITIONS      = 3
+RISQUE_PAR_TRADE   = 0.02       # 2% du capital par trade
+MAX_POSITIONS      = 6          # ✅ 6 positions max simultanées
 ATR_MULTIPLICATEUR = 1.5
-TP1_PCT = 0.08
-TP2_PCT = 0.15
-TP3_PCT = 0.25
+TP1_PCT  = 0.04                 # ✅ +4%
+TP2_PCT  = 0.08                 # ✅ +8%
+TP3_PCT  = 0.15                 # ✅ +15%
 SL_SECURISE = 0.005
 TZ_PARIS = pytz.timezone("Europe/Paris")
 
 # ═══════════════════════════════════════════════════════════════
-#  MATIÈRES PREMIÈRES HALAL
+#  UNIVERS ÉLARGI — 25 ACTIFS HALAL
 # ═══════════════════════════════════════════════════════════════
 
 matieres_premieres = {
     "GLD":  "Or 🥇",
     "SLV":  "Argent 🥈",
-    "CPER": "Cuivre 🔶",
+    "SGOL": "Or physique",
+    "PPLT": "Platine",
+    "PALL": "Palladium",
     "USO":  "Pétrole brut 🛢️",
     "BNO":  "Brent Oil 🛢️",
-    "PPLT": "Platine",
-    "SGOL": "Or physique",
-    "NEM":  "Newmont (Or minier)",
-    "FCX":  "Freeport McMoRan",
+    "UNG":  "Gaz naturel",
+    "CPER": "Cuivre 🔶",
+    "FCX":  "Freeport (Cuivre)",
+    "NEM":  "Newmont (Or)",
+    "AEM":  "Agnico Eagle (Or)",
+    "WPM":  "Wheaton Precious",
     "BHP":  "BHP Group",
     "RIO":  "Rio Tinto",
+    "VALE": "Vale (Fer/Nickel)",
     "WEAT": "Blé 🌾",
     "CORN": "Maïs 🌽",
     "SOYB": "Soja",
     "DBA":  "Agriculture",
+    "MOO":  "Agribusiness",
     "PHO":  "Eau 💧",
+    "CGW":  "Eau mondiale",
+    "DJP":  "Commodities large",
+    "PDBC": "Commodities actif",
 }
 
 # ═══════════════════════════════════════════════════════════════
@@ -75,8 +84,23 @@ def calcul_atr(df, periode=14):
 def calcul_stochastique(df, k=14, d=3):
     low_min  = df["Low"].rolling(k).min()
     high_max = df["High"].rolling(k).max()
-    df["%K"]  = 100 * (df["Close"] - low_min) / (high_max - low_min)
+    df["%K"]  = 100 * (df["Close"] - low_min) / (high_max - low_min + 1e-9)
     df["%D"]  = df["%K"].rolling(d).mean()
+    return df
+
+def calcul_rsi(df, periode=14):
+    delta = df["Close"].diff()
+    gain  = delta.clip(lower=0).rolling(periode).mean()
+    perte = (-delta.clip(upper=0)).rolling(periode).mean()
+    rs    = gain / (perte + 1e-9)
+    df["RSI"] = 100 - (100 / (1 + rs))
+    return df
+
+def calcul_macd(df):
+    ema12            = df["Close"].ewm(span=12).mean()
+    ema26            = df["Close"].ewm(span=26).mean()
+    df["MACD"]       = ema12 - ema26
+    df["Signal_MACD"]= df["MACD"].ewm(span=9).mean()
     return df
 
 def calcul_zones(df, periode=20):
@@ -84,42 +108,51 @@ def calcul_zones(df, periode=20):
     df["Ecart"]      = df["Close"].rolling(periode).std()
     df["Zone_Haute"] = df["Moyenne"] + 2 * df["Ecart"]
     df["Zone_Basse"] = df["Moyenne"] - 2 * df["Ecart"]
+    df["Zone_Mid"]   = df["Moyenne"]
     return df
 
 def calcul_tendance(ticker):
     for tentative in range(3):
         try:
-            df_w = yf.download(ticker, period="6mo", interval="1wk",
+            df_w = yf.download(ticker, period="3mo", interval="1d",
                                auto_adjust=True, progress=False)
-            if df_w is None or len(df_w) < 10:
-                return "INCONNUE"
+            if df_w is None or len(df_w) < 20:
+                return "NEUTRE"
             df_w.columns = df_w.columns.get_level_values(0)
-            df_w["MA10"] = df_w["Close"].rolling(10).mean()
-            last = df_w.iloc[-1]
-            return "HAUSSE" if float(last["Close"]) > float(last["MA10"]) else "BAISSE"
-        except Exception as e:
-            print(f"  ⚠️ Tendance {ticker} tentative {tentative+1}/3 : {e}")
+            df_w["MA20"] = df_w["Close"].rolling(20).mean()
+            last  = df_w.iloc[-1]
+            close = float(last["Close"])
+            ma20  = float(last["MA20"])
+            if close > ma20 * 1.01:
+                return "HAUSSE"
+            elif close < ma20 * 0.99:
+                return "BAISSE"
+            else:
+                return "NEUTRE"
+        except Exception:
             time.sleep(5 * (tentative + 1))
-    return "INCONNUE"
+    return "NEUTRE"
 
 # ═══════════════════════════════════════════════════════════════
-#  SIGNAL 15MIN — avec retry anti-rate-limit
+#  TÉLÉCHARGEMENT AVEC RETRY
 # ═══════════════════════════════════════════════════════════════
 
-def telecharger_donnees(ticker, period="5d", interval="15m", max_tentatives=3):
-    for tentative in range(max_tentatives):
+def telecharger_donnees(ticker, period="5d", interval="15m"):
+    for tentative in range(3):
         try:
             df = yf.download(ticker, period=period, interval=interval,
                              auto_adjust=True, progress=False)
-            if df is not None and len(df) >= 50:
+            if df is not None and len(df) >= 30:
                 return df
             time.sleep(3)
         except Exception as e:
-            attente = 10 * (tentative + 1)
-            print(f"  ⚠️ Yahoo Finance {ticker} (tentative {tentative+1}/{max_tentatives}) : {e}")
-            print(f"  ⏳ Attente {attente}s...")
-            time.sleep(attente)
+            print(f"  ⚠️ {ticker} tentative {tentative+1} : {e}")
+            time.sleep(10 * (tentative + 1))
     return None
+
+# ═══════════════════════════════════════════════════════════════
+#  3 TYPES DE SIGNAUX — SCORE MINIMUM 4/6
+# ═══════════════════════════════════════════════════════════════
 
 def analyser_signal(ticker):
     df = telecharger_donnees(ticker)
@@ -128,36 +161,83 @@ def analyser_signal(ticker):
 
     df.columns = df.columns.get_level_values(0)
     df = calcul_stochastique(df)
+    df = calcul_rsi(df)
+    df = calcul_macd(df)
     df = calcul_zones(df)
     df = calcul_atr(df)
 
-    dernier   = df.iloc[-1]
-    prix      = float(dernier["Close"])
-    k         = float(dernier["%K"])
-    d_val     = float(dernier["%D"])
-    atr       = float(dernier["ATR"])
-    vol_moyen = df["Volume"].rolling(20).mean().iloc[-1]
-    vol_fort  = float(dernier["Volume"]) > vol_moyen * 1.5
-    tendance  = calcul_tendance(ticker)
+    if len(df) < 30:
+        return None
 
-    if (prix <= float(dernier["Zone_Basse"]) and
-        k < 25 and d_val < 25 and
-        vol_fort and tendance == "HAUSSE"):
+    d    = df.iloc[-1]
+    d_1  = df.iloc[-2]
 
-        capital_trade = CAPITAL_TOTAL * RISQUE_PAR_TRADE
-        quantite      = max(1, int(capital_trade / prix))
+    prix      = float(d["Close"])
+    k         = float(d["%K"])
+    k_prev    = float(d_1["%K"])
+    d_val     = float(d["%D"])
+    rsi       = float(d["RSI"])
+    macd      = float(d["MACD"])
+    macd_sig  = float(d["Signal_MACD"])
+    macd_prev = float(d_1["MACD"])
+    sig_prev  = float(d_1["Signal_MACD"])
+    atr       = float(d["ATR"])
+    zone_b    = float(d["Zone_Basse"])
+    zone_mid  = float(d["Zone_Mid"])
 
-        return {
-            "ticker":   ticker,
-            "prix":     prix,
-            "sl":       round(prix - (atr * ATR_MULTIPLICATEUR), 4),
-            "tp1":      round(prix * (1 + TP1_PCT), 4),
-            "tp2":      round(prix * (1 + TP2_PCT), 4),
-            "tp3":      round(prix * (1 + TP3_PCT), 4),
-            "quantite": quantite,
-            "capital":  round(quantite * prix, 2),
-        }
-    return None
+    vol_moyen  = df["Volume"].rolling(20).mean().iloc[-1]
+    vol_actuel = float(d["Volume"])
+    vol_ok     = vol_actuel > vol_moyen * 1.0
+
+    tendance    = calcul_tendance(ticker)
+    tendance_ok = tendance in ["HAUSSE", "NEUTRE"]
+
+    signal_type = None
+    score = 0
+
+    # ─── SIGNAL A : Rebond zone basse Belkhayat ───────────────
+    if prix <= zone_b * 1.015 and k < 30 and d_val < 35 and tendance_ok:
+        signal_type = "REBOND_ZONE_BASSE"
+        score = 3
+        if vol_ok:          score += 1
+        if k > k_prev:      score += 1  # stoch remonte
+        if rsi < 40:        score += 1
+
+    # ─── SIGNAL B : Croisement MACD haussier ──────────────────
+    elif (macd > macd_sig and macd_prev <= sig_prev
+          and rsi > 35 and rsi < 65 and tendance_ok):
+        signal_type = "CROISEMENT_MACD"
+        score = 3
+        if vol_ok:              score += 1
+        if prix < zone_mid:     score += 1
+        if k < 60:              score += 1
+
+    # ─── SIGNAL C : RSI survendu + retournement stoch ─────────
+    elif rsi < 35 and k > k_prev and k < 45 and tendance_ok and vol_ok:
+        signal_type = "RSI_SURVENDU"
+        score = 3
+        if prix <= zone_b * 1.02:   score += 1
+        if macd > macd_prev:        score += 1
+        if k > d_val:               score += 1
+
+    if signal_type is None or score < 4:
+        return None
+
+    capital_trade = CAPITAL_TOTAL * RISQUE_PAR_TRADE
+    quantite      = max(1, int(capital_trade / prix))
+
+    return {
+        "ticker":      ticker,
+        "prix":        prix,
+        "signal_type": signal_type,
+        "score":       score,
+        "sl":          round(prix - (atr * ATR_MULTIPLICATEUR), 4),
+        "tp1":         round(prix * (1 + TP1_PCT), 4),
+        "tp2":         round(prix * (1 + TP2_PCT), 4),
+        "tp3":         round(prix * (1 + TP3_PCT), 4),
+        "quantite":    quantite,
+        "capital":     round(quantite * prix, 2),
+    }
 
 # ═══════════════════════════════════════════════════════════════
 #  ORDRES ALPACA
@@ -172,11 +252,12 @@ def passer_ordre_achat(signal):
             time_in_force=TimeInForce.DAY
         )
         result = client.submit_order(ordre)
-        print(f"  ✅ ORDRE ACHAT : {signal['quantite']} x {signal['ticker']} à ~{signal['prix']:.2f}$")
-        print(f"     Order ID : {result.id}")
+        print(f"  ✅ ACHAT {signal['ticker']} | {signal['signal_type']} | Score {signal['score']}/6")
+        print(f"     {signal['quantite']} actions x {signal['prix']:.2f}$ = {signal['capital']:.2f}$")
+        print(f"     SL: {signal['sl']:.2f}$ | TP1: {signal['tp1']:.2f}$ | TP2: {signal['tp2']:.2f}$ | TP3: {signal['tp3']:.2f}$")
         return result.id
     except Exception as e:
-        print(f"  ❌ Erreur ordre achat : {e}")
+        print(f"  ❌ Erreur achat {signal['ticker']} : {e}")
         return None
 
 def passer_ordre_vente(ticker, quantite):
@@ -188,10 +269,10 @@ def passer_ordre_vente(ticker, quantite):
             time_in_force=TimeInForce.DAY
         )
         result = client.submit_order(ordre)
-        print(f"  ✅ VENTE : {quantite} x {ticker}")
+        print(f"  ✅ VENTE {quantite} x {ticker}")
         return result.id
     except Exception as e:
-        print(f"  ❌ Erreur vente : {e}")
+        print(f"  ❌ Erreur vente {ticker} : {e}")
         return None
 
 # ═══════════════════════════════════════════════════════════════
@@ -204,16 +285,16 @@ def gerer_positions():
     if not portefeuille:
         return
 
-    print("\n📂 Gestion positions ouvertes :")
+    print("\n📂 Positions ouvertes :")
     try:
         positions_alpaca = {p.symbol: p for p in client.get_all_positions()}
     except Exception as e:
-        print(f"  ❌ Erreur récupération positions : {e}")
+        print(f"  ❌ Erreur positions : {e}")
         return
 
     for ticker, pos in list(portefeuille.items()):
         if ticker not in positions_alpaca:
-            print(f"  ℹ️ {ticker} déjà fermée")
+            print(f"  ℹ️ {ticker} fermée")
             del portefeuille[ticker]
             continue
 
@@ -222,30 +303,29 @@ def gerer_positions():
         gain_pct    = ((prix_actuel - entree) / entree) * 100
         quantite    = int(positions_alpaca[ticker].qty)
 
-        print(f"\n  📌 {ticker} | Entrée: {entree:.2f}$ | Actuel: {prix_actuel:.2f}$ | {gain_pct:+.2f}%")
+        print(f"  📌 {ticker} | {entree:.2f}$ → {prix_actuel:.2f}$ | {gain_pct:+.2f}%")
 
         fermer = False
         raison = ""
 
         if prix_actuel <= pos["sl"]:
             fermer = True
-            raison = f"🛑 Stop Loss touché {prix_actuel:.2f}$"
+            raison = f"🛑 Stop Loss"
         elif prix_actuel >= pos["tp3"]:
             fermer = True
-            raison = f"🎉 TP3 +25% atteint !"
+            raison = f"🎉 TP3 +15% !"
         elif prix_actuel >= pos["tp2"] and not pos.get("tp2_atteint"):
             pos["tp2_atteint"] = True
             pos["sl"] = pos["tp1"]
-            print(f"     ✅ TP2 atteint ! SL → {pos['tp1']:.2f}$")
+            print(f"     ✅ TP2 +8% ! SL → {pos['tp1']:.2f}$")
         elif prix_actuel >= pos["tp1"] and not pos.get("tp1_atteint"):
             pos["tp1_atteint"] = True
             pos["sl"] = round(entree * (1 + SL_SECURISE), 4)
-            print(f"     ✅ TP1 atteint ! SL sécurisé → {pos['sl']:.2f}$")
+            print(f"     ✅ TP1 +4% ! SL sécurisé → {pos['sl']:.2f}$")
 
         if fermer:
-            print(f"     {raison}")
             pnl = (prix_actuel - entree) * quantite
-            print(f"     💰 PnL : {pnl:+.2f}$")
+            print(f"     {raison} | PnL: {pnl:+.2f}$")
             passer_ordre_vente(ticker, quantite)
             del portefeuille[ticker]
 
@@ -256,7 +336,6 @@ def gerer_positions():
 def est_heure_tradeable():
     now   = datetime.now(TZ_PARIS)
     heure = now.hour + now.minute / 60
-    # Marchés US : 15h30 → 22h00 Paris | Pré-marché : 9h00 → 15h30
     tradeable = (9.0 <= heure <= 17.5) or (15.5 <= heure <= 22.0)
     return tradeable, now.strftime("%H:%M")
 
@@ -264,14 +343,16 @@ def est_heure_tradeable():
 #  BOUCLE PRINCIPALE
 # ═══════════════════════════════════════════════════════════════
 
-def lancer_robot(nb_cycles=999, pause_minutes=15):
-    print("\n🤖 ROBOT HALAL MATIÈRES PREMIÈRES - BELKHAYAT + ALPACA")
+def lancer_robot(nb_cycles=9999, pause_minutes=15):
+    print("\n🤖 ROBOT HALAL V2 — MULTI-SIGNAUX BELKHAYAT")
     print("=" * 60)
-    print(f"💰 Capital    : {CAPITAL_TOTAL:.2f}$")
-    print(f"🎯 Par trade  : {CAPITAL_TOTAL * RISQUE_PAR_TRADE:.2f}$ (2%)")
-    print(f"📦 Max trades : {MAX_POSITIONS}")
-    print(f"🎯 TP1/2/3    : +8% / +15% / +25%")
-    print(f"⏱️  Scan       : toutes les {pause_minutes} minutes")
+    print(f"💰 Capital       : {CAPITAL_TOTAL:.2f}$")
+    print(f"🎯 Par trade     : {CAPITAL_TOTAL * RISQUE_PAR_TRADE:.2f}$ (2%)")
+    print(f"📦 Max positions : {MAX_POSITIONS}")
+    print(f"📈 3 Signaux     : REBOND_ZONE_BASSE | CROISEMENT_MACD | RSI_SURVENDU")
+    print(f"🎯 TP1/2/3       : +4% / +8% / +15%")
+    print(f"🌍 Actifs        : {len(matieres_premieres)}")
+    print(f"⏱️  Scan          : toutes les {pause_minutes} minutes")
     print("=" * 60)
 
     for cycle in range(nb_cycles):
@@ -279,63 +360,65 @@ def lancer_robot(nb_cycles=999, pause_minutes=15):
         print(f"🔄 Cycle {cycle+1}")
 
         tradeable, heure = est_heure_tradeable()
-        print(f"🕐 {heure} (Paris) | Marché : {'✅ Ouvert' if tradeable else '❌ Fermé'}")
+        print(f"🕐 {heure} Paris | {'✅ Marché OUVERT' if tradeable else '❌ Marché FERMÉ'}")
 
         if not tradeable:
-            print(f"⏳ Marché fermé — pause {pause_minutes}min...")
+            print(f"⏳ Pause {pause_minutes}min...")
             time.sleep(pause_minutes * 60)
             continue
 
-        # Mise à jour capital
         try:
             account = client.get_account()
-            capital_dispo = float(account.cash)
-            print(f"💰 Cash disponible : {capital_dispo:.2f}$")
+            print(f"💰 Cash: {float(account.cash):.2f}$ | Portef: {float(account.portfolio_value):.2f}$")
         except Exception as e:
             print(f"  ⚠️ Erreur compte : {e}")
 
-        # Gérer positions ouvertes
         gerer_positions()
 
-        # Chercher nouveaux signaux
         places = MAX_POSITIONS - len(portefeuille)
         if places > 0:
-            print(f"\n🔍 Recherche signaux ({places} place(s) disponible(s))...")
+            print(f"\n🔍 Scan {len(matieres_premieres)} actifs ({places} place(s) dispo)...")
+            signaux_trouves = []
+
             for ticker, nom in matieres_premieres.items():
-                if ticker in portefeuille or len(portefeuille) >= MAX_POSITIONS:
+                if ticker in portefeuille:
                     continue
                 try:
-                    print(f"  📊 Analyse {ticker} ({nom})...", end=" ")
                     signal = analyser_signal(ticker)
                     if signal:
-                        print(f"🚨 SIGNAL !")
-                        order_id = passer_ordre_achat(signal)
-                        if order_id:
-                            portefeuille[ticker] = {
-                                "prix_entree": signal["prix"],
-                                "quantite":    signal["quantite"],
-                                "sl":          signal["sl"],
-                                "tp1":         signal["tp1"],
-                                "tp2":         signal["tp2"],
-                                "tp3":         signal["tp3"],
-                                "tp1_atteint": False,
-                                "tp2_atteint": False,
-                                "order_id":    order_id,
-                            }
-                            print(f"     SL: {signal['sl']:.2f}$ | TP1: {signal['tp1']:.2f}$ | TP2: {signal['tp2']:.2f}$ | TP3: {signal['tp3']:.2f}$")
-                    else:
-                        print("pas de signal")
-                    # ✅ DÉLAI ANTI-RATE-LIMIT Yahoo Finance
+                        signaux_trouves.append(signal)
+                        print(f"  🚨 {ticker} ({nom}) — {signal['signal_type']} score {signal['score']}/6")
                     time.sleep(3)
                 except Exception as e:
-                    print(f"erreur : {e}")
                     time.sleep(5)
                     continue
-        else:
-            print("📦 Portefeuille plein, pas de nouveau signal")
 
-        # Résumé cycle
-        print(f"\n📊 Positions actives : {len(portefeuille)}/{MAX_POSITIONS}")
+            # Trier par meilleur score
+            signaux_trouves.sort(key=lambda x: x["score"], reverse=True)
+            print(f"\n  📊 {len(signaux_trouves)} signal(s) trouvé(s)")
+
+            for signal in signaux_trouves:
+                if len(portefeuille) >= MAX_POSITIONS:
+                    break
+                if signal["ticker"] in portefeuille:
+                    continue
+                order_id = passer_ordre_achat(signal)
+                if order_id:
+                    portefeuille[signal["ticker"]] = {
+                        "prix_entree": signal["prix"],
+                        "quantite":    signal["quantite"],
+                        "sl":          signal["sl"],
+                        "tp1":         signal["tp1"],
+                        "tp2":         signal["tp2"],
+                        "tp3":         signal["tp3"],
+                        "tp1_atteint": False,
+                        "tp2_atteint": False,
+                        "order_id":    order_id,
+                    }
+        else:
+            print("📦 Portefeuille plein (6/6)")
+
+        print(f"\n📊 Positions: {len(portefeuille)}/{MAX_POSITIONS}")
         for t, p in portefeuille.items():
             print(f"   {t} | Entrée: {p['prix_entree']:.2f}$ | SL: {p['sl']:.2f}$ | TP1: {p['tp1']:.2f}$")
 
@@ -345,4 +428,4 @@ def lancer_robot(nb_cycles=999, pause_minutes=15):
     print("\n✅ Robot terminé.")
 
 # LANCEMENT
-lancer_robot(nb_cycles=999, pause_minutes=15)
+lancer_robot(nb_cycles=9999, pause_minutes=15)
