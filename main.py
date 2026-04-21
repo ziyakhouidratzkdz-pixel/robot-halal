@@ -11,7 +11,7 @@ from alpaca.trading.requests import (
     StopLossRequest,
     TakeProfitRequest
 )
-from alpaca.trading.enums import OrderSide, TimeInForce, OrderClass, PositionSide
+from alpaca.trading.enums import OrderSide, TimeInForce, OrderClass
 
 # ═══════════════════════════════════════════════════════════════
 #  CONNEXION ALPACA PAPER TRADING
@@ -31,19 +31,19 @@ print(f"📊 Valeur portefeuille : {float(account.portfolio_value):.2f}$")
 #  CONFIGURATION
 # ═══════════════════════════════════════════════════════════════
 
-CAPITAL_TOTAL      = float(account.cash)
-RISQUE_PAR_TRADE   = 0.02        # 2% par trade
-MAX_LONG_SWING     = 4           # Max 4 trades TYPE 1 (swing)
-MAX_SCALP          = 3           # Max 3 trades TYPE 2 (scalp rapide)
-ATR_MULT_SWING     = 1.5         # SL swing = 1.5x ATR
-ATR_MULT_SCALP     = 0.5         # SL scalp = 0.5x ATR (très court)
-TP_SCALP_PCT       = 0.008       # TP scalp = +0.8% (sortie rapide)
-SL_SCALP_PCT       = 0.004       # SL scalp = -0.4% (serré)
-MECHE_MULTIPLICATEUR = 3         # Mèche ≥ 3x le corps
-HEURE_FERMETURE    = 21          # Fermeture forcée à 21h00
-HEURE_OUVERTURE    = 9           # Ouverture à 9h00
-HEURE_FIN_SCALP    = 17          # Scalp uniquement jusqu'à 17h
-TZ_PARIS           = pytz.timezone("Europe/Paris")
+CAPITAL_TOTAL        = float(account.cash)
+RISQUE_PAR_TRADE     = 0.02
+MAX_LONG_SWING       = 4
+MAX_SCALP            = 3
+ATR_MULT_SWING       = 1.5
+SL_SCALP_PCT         = 0.004    # SL scalp -0.4%
+TP_SCALP_PCT         = 0.008    # TP scalp +0.8%
+MECHE_MULTIPLICATEUR = 2        # Mèche ≥ 3x corps
+HEURE_OUVERTURE      = 9
+HEURE_FIN_SCALP      = 17
+HEURE_FERMETURE      = 21
+DELAI_REQUETE        = 8        # ✅ 8 secondes entre chaque requête Yahoo
+TZ_PARIS             = pytz.timezone("Europe/Paris")
 
 # ═══════════════════════════════════════════════════════════════
 #  3 ACTIFS HALAL UNIQUEMENT
@@ -54,6 +54,26 @@ actifs = {
     "SGOL": "Or physique 🥇 (équivalent GC)",
     "USO":  "Pétrole 🛢️ (équivalent CL)",
 }
+
+# ═══════════════════════════════════════════════════════════════
+#  TÉLÉCHARGEMENT AVEC RETRY ROBUSTE
+# ═══════════════════════════════════════════════════════════════
+
+def telecharger_donnees(ticker, period="5d", interval="15m"):
+    for tentative in range(4):
+        try:
+            df = yf.download(ticker, period=period, interval=interval,
+                             auto_adjust=True, progress=False)
+            if df is not None and len(df) >= 30:
+                df.columns = df.columns.get_level_values(0)
+                return df
+            time.sleep(DELAI_REQUETE)
+        except Exception as e:
+            attente = DELAI_REQUETE * (tentative + 2)
+            print(f"  ⚠️ {ticker} tentative {tentative+1}/4 — attente {attente}s")
+            time.sleep(attente)
+    print(f"  ❌ {ticker} inaccessible après 4 tentatives")
+    return None
 
 # ═══════════════════════════════════════════════════════════════
 #  INDICATEURS
@@ -116,7 +136,7 @@ def calcul_tendance(ticker):
             else:
                 return "NEUTRE"
         except Exception:
-            time.sleep(5 * (tentative + 1))
+            time.sleep(DELAI_REQUETE * (tentative + 1))
     return "NEUTRE"
 
 # ═══════════════════════════════════════════════════════════════
@@ -124,81 +144,52 @@ def calcul_tendance(ticker):
 # ═══════════════════════════════════════════════════════════════
 
 def detecter_pattern_meche(df):
-    """
-    Détecte les patterns de grandes mèches sur la dernière bougie.
-    Retourne : 'MARTEAU', 'MARTEAU_INVERSE', 'ETOILE_MATIN', 
-               'ETOILE_SOIR', ou None
-    Règle : mèche ≥ 3× le corps de la bougie
-    """
-    if len(df) < 3:
+    if df is None or len(df) < 3:
         return None
 
-    # Dernière bougie
+    def analyse_bougie(row):
+        ouv  = float(row["Open"])
+        clo  = float(row["Close"])
+        haut = float(row["High"])
+        bas  = float(row["Low"])
+        corps      = abs(clo - ouv)
+        if corps < 1e-9: corps = 1e-9
+        meche_h    = haut - max(ouv, clo)
+        meche_b    = min(ouv, clo) - bas
+        return corps, meche_h, meche_b, ouv, clo
+
     d   = df.iloc[-1]
     d_1 = df.iloc[-2]
     d_2 = df.iloc[-3]
 
-    def analyse_bougie(row):
-        ouv   = float(row["Open"])
-        clo   = float(row["Close"])
-        haut  = float(row["High"])
-        bas   = float(row["Low"])
-        corps = abs(clo - ouv)
-        if corps < 1e-9:
-            corps = 1e-9
-        meche_haute = haut - max(ouv, clo)
-        meche_basse = min(ouv, clo) - bas
-        return corps, meche_haute, meche_basse, ouv, clo
+    corps,   meche_h,  meche_b,  ouv,   clo   = analyse_bougie(d)
+    corps_1, meche_h1, meche_b1, ouv_1, clo_1 = analyse_bougie(d_1)
+    corps_2, meche_h2, meche_b2, ouv_2, clo_2 = analyse_bougie(d_2)
 
-    corps, meche_h, meche_b, ouv, clo = analyse_bougie(d)
-    corps_1, _, _, ouv_1, clo_1       = analyse_bougie(d_1)
-    corps_2, _, _, ouv_2, clo_2       = analyse_bougie(d_2)
-
-    # ── MARTEAU : grande mèche BASSE ≥ 3× corps → signal ACHAT
+    # MARTEAU : grande mèche BASSE → ACHAT
     if meche_b >= MECHE_MULTIPLICATEUR * corps and meche_h < corps:
         return "MARTEAU"
 
-    # ── MARTEAU INVERSE : grande mèche HAUTE ≥ 3× corps → signal ACHAT
+    # MARTEAU INVERSE : grande mèche HAUTE → SHORT
     if meche_h >= MECHE_MULTIPLICATEUR * corps and meche_b < corps:
         return "MARTEAU_INVERSE"
 
-    # ── ÉTOILE DU MATIN : 3 bougies (rouge + petite + verte) → ACHAT
-    bougie_1_rouge  = clo_2 < ouv_2                        # 1ère bougie rouge
-    bougie_2_petite = corps_1 < corps_2 * 0.3              # 2ème petite
-    bougie_3_verte  = clo > ouv and clo > (ouv_2 + clo_2) / 2  # 3ème verte
-    if bougie_1_rouge and bougie_2_petite and bougie_3_verte:
+    # ÉTOILE DU MATIN : rouge + petite + verte → ACHAT
+    if (clo_2 < ouv_2 and
+        corps_1 < corps_2 * 0.3 and
+        clo > ouv and clo > (ouv_2 + clo_2) / 2):
         return "ETOILE_MATIN"
 
-    # ── ÉTOILE DU SOIR : 3 bougies (verte + petite + rouge) → VENTE/SHORT
-    bougie_1_verte  = clo_2 > ouv_2                        # 1ère bougie verte
-    bougie_2_petite2= corps_1 < corps_2 * 0.3              # 2ème petite
-    bougie_3_rouge  = clo < ouv and clo < (ouv_2 + clo_2) / 2  # 3ème rouge
-    if bougie_1_verte and bougie_2_petite2 and bougie_3_rouge:
+    # ÉTOILE DU SOIR : verte + petite + rouge → SHORT
+    if (clo_2 > ouv_2 and
+        corps_1 < corps_2 * 0.3 and
+        clo < ouv and clo < (ouv_2 + clo_2) / 2):
         return "ETOILE_SOIR"
 
     return None
 
 # ═══════════════════════════════════════════════════════════════
-#  TÉLÉCHARGEMENT AVEC RETRY
-# ═══════════════════════════════════════════════════════════════
-
-def telecharger_donnees(ticker, period="5d", interval="15m"):
-    for tentative in range(3):
-        try:
-            df = yf.download(ticker, period=period, interval=interval,
-                             auto_adjust=True, progress=False)
-            if df is not None and len(df) >= 30:
-                df.columns = df.columns.get_level_values(0)
-                return df
-            time.sleep(3)
-        except Exception as e:
-            print(f"  ⚠️ {ticker} tentative {tentative+1} : {e}")
-            time.sleep(10 * (tentative + 1))
-    return None
-
-# ═══════════════════════════════════════════════════════════════
-#  TYPE 1 — SIGNAL SWING LONG (Belkhayat + RSI + MACD)
-#  Max 4 trades, lancés à partir de 9h, fermés à 21h
+#  TYPE 1 — SWING LONG (Belkhayat + RSI + MACD)
 # ═══════════════════════════════════════════════════════════════
 
 def signal_swing_long(ticker):
@@ -231,6 +222,7 @@ def signal_swing_long(ticker):
     vol_moyen = df["Volume"].rolling(20).mean().iloc[-1]
     vol_ok    = float(d["Volume"]) > vol_moyen
 
+    time.sleep(DELAI_REQUETE)  # ✅ anti rate limit avant tendance
     tendance    = calcul_tendance(ticker)
     tendance_ok = tendance in ["HAUSSE", "NEUTRE"]
 
@@ -254,7 +246,7 @@ def signal_swing_long(ticker):
         if prix < zone_mid: score += 1
         if k < 60:          score += 1
 
-    # RSI survendu + retournement
+    # RSI survendu + retournement stoch
     elif rsi < 35 and k > k_prev and k < 45 and tendance_ok and vol_ok:
         signal_type = "RSI_SURVENDU"
         score = 3
@@ -269,21 +261,19 @@ def signal_swing_long(ticker):
     sl       = round(prix - (atr * ATR_MULT_SWING), 2)
 
     return {
-        "ticker":      ticker,
-        "type":        "SWING_LONG",
-        "signal":      signal_type,
-        "score":       score,
-        "prix":        prix,
-        "sl":          sl,
-        "quantite":    quantite,
-        "capital":     round(quantite * prix, 2),
-        "direction":   "LONG",
+        "ticker":    ticker,
+        "type":      "SWING_LONG",
+        "signal":    signal_type,
+        "score":     score,
+        "prix":      prix,
+        "sl":        sl,
+        "quantite":  quantite,
+        "capital":   round(quantite * prix, 2),
+        "direction": "LONG",
     }
 
 # ═══════════════════════════════════════════════════════════════
-#  TYPE 2 — SIGNAL SCALP RAPIDE (Mèches + confirmation)
-#  2-3 trades, toute la journée 9h→17h, TP/SL très courts
-#  LONG sur Marteau / SHORT sur Marteau inverse + Étoile soir
+#  TYPE 2 — SCALP RAPIDE (Mèches ×3 + confirmation)
 # ═══════════════════════════════════════════════════════════════
 
 def signal_scalp(ticker):
@@ -302,26 +292,20 @@ def signal_scalp(ticker):
 
     d    = df.iloc[-1]
     d_1  = df.iloc[-2]
-    prix = float(d["Close"])
-    atr  = float(d["ATR"])
-    rsi  = float(d["RSI"])
-    macd = float(d["MACD"])
-    macd_sig  = float(d["Signal_MACD"])
+    prix      = float(d["Close"])
+    rsi       = float(d["RSI"])
+    macd      = float(d["MACD"])
     macd_prev = float(d_1["MACD"])
-    sig_prev  = float(d_1["Signal_MACD"])
 
-    direction   = None
-    signal_type = pattern
+    direction = None
 
-    # ── LONG : Marteau ou Étoile du matin
+    # LONG : Marteau ou Étoile du matin
     if pattern in ["MARTEAU", "ETOILE_MATIN"]:
-        # Confirmation supplémentaire
         if rsi < 65 and macd >= macd_prev:
             direction = "LONG"
 
-    # ── SHORT : Marteau inverse ou Étoile du soir
+    # SHORT : Marteau inverse ou Étoile du soir
     elif pattern in ["MARTEAU_INVERSE", "ETOILE_SOIR"]:
-        # Confirmation supplémentaire
         if rsi > 35 and macd <= macd_prev:
             direction = "SHORT"
 
@@ -333,14 +317,14 @@ def signal_scalp(ticker):
     if direction == "LONG":
         sl = round(prix * (1 - SL_SCALP_PCT), 2)
         tp = round(prix * (1 + TP_SCALP_PCT), 2)
-    else:  # SHORT
+    else:
         sl = round(prix * (1 + SL_SCALP_PCT), 2)
         tp = round(prix * (1 - TP_SCALP_PCT), 2)
 
     return {
         "ticker":    ticker,
         "type":      "SCALP",
-        "signal":    signal_type,
+        "signal":    pattern,
         "direction": direction,
         "prix":      prix,
         "sl":        sl,
@@ -377,10 +361,11 @@ def signal_sortie_swing(ticker, prix_entree):
     zone_h   = float(d["Zone_Haute"])
     zone_mid = float(d["Zone_Mid"])
 
+    # On ne vend jamais en perte → SL Alpaca gère
     if prix < prix_entree:
         return False, None
 
-    # Zone haute Belkhayat + stoch suracheté
+    # Zone haute Belkhayat + stoch suracheté qui redescend
     if prix >= zone_h * 0.985 and k > 70 and k < k_prev and rsi > 65:
         return True, "ZONE_HAUTE_BELKHAYAT"
 
@@ -388,11 +373,11 @@ def signal_sortie_swing(ticker, prix_entree):
     if macd < macd_sig and macd_prev >= sig_prev and rsi > 50:
         return True, "MACD_BAISSIER"
 
-    # RSI suracheté + retournement
+    # RSI suracheté + retournement stoch
     if rsi > 72 and k < k_prev:
         return True, "RSI_SURACHETÉ"
 
-    # Pattern bougie de retournement
+    # Pattern de retournement baissier
     pattern = detecter_pattern_meche(df)
     if pattern in ["MARTEAU_INVERSE", "ETOILE_SOIR"]:
         return True, f"PATTERN_{pattern}"
@@ -404,7 +389,6 @@ def signal_sortie_swing(ticker, prix_entree):
 # ═══════════════════════════════════════════════════════════════
 
 def passer_achat(signal):
-    """Ordre LONG avec SL automatique Alpaca"""
     try:
         ordre = MarketOrderRequest(
             symbol=signal["ticker"],
@@ -428,14 +412,13 @@ def passer_achat(signal):
                 time_in_force=TimeInForce.DAY
             )
             result = client.submit_order(ordre_simple)
-            print(f"  ✅ LONG simple {signal['ticker']}")
+            print(f"  ✅ LONG simple {signal['ticker']} (sans SL auto)")
             return result.id
         except Exception as e2:
             print(f"  ❌ Échec total : {e2}")
             return None
 
 def passer_short(signal):
-    """Ordre SHORT avec SL et TP automatiques"""
     try:
         ordre = MarketOrderRequest(
             symbol=signal["ticker"],
@@ -480,35 +463,27 @@ def fermeture_forcee_tout():
         for pos in positions:
             ticker   = pos.symbol
             quantite = abs(int(float(pos.qty)))
-            side_pos = pos.side
+            cote     = str(pos.side)
             try:
-                if str(side_pos) == "long":
-                    ordre = MarketOrderRequest(
-                        symbol=ticker,
-                        qty=quantite,
-                        side=OrderSide.SELL,
-                        time_in_force=TimeInForce.DAY
-                    )
-                else:
-                    ordre = MarketOrderRequest(
-                        symbol=ticker,
-                        qty=quantite,
-                        side=OrderSide.BUY,
-                        time_in_force=TimeInForce.DAY
-                    )
+                side = OrderSide.SELL if "long" in cote else OrderSide.BUY
+                ordre = MarketOrderRequest(
+                    symbol=ticker, qty=quantite,
+                    side=side,
+                    time_in_force=TimeInForce.DAY
+                )
                 client.submit_order(ordre)
-                print(f"  ✅ {ticker} fermée ({quantite} actions)")
+                print(f"  ✅ {ticker} fermée")
             except Exception as e:
-                print(f"  ❌ Erreur fermeture {ticker} : {e}")
+                print(f"  ❌ {ticker} : {e}")
     except Exception as e:
-        print(f"  ❌ Erreur récupération positions : {e}")
+        print(f"  ❌ Erreur fermeture globale : {e}")
 
 # ═══════════════════════════════════════════════════════════════
 #  PORTEFEUILLES
 # ═══════════════════════════════════════════════════════════════
 
-swing_positions  = {}   # TYPE 1 — max 4 swings long
-scalp_positions  = {}   # TYPE 2 — max 3 scalps rapides
+swing_positions = {}   # max 4
+scalp_positions = {}   # max 3
 
 # ═══════════════════════════════════════════════════════════════
 #  GESTION POSITIONS SWING
@@ -541,7 +516,7 @@ def gerer_swing():
             if sortir:
                 passer_vente(ticker, quantite, raison)
                 del swing_positions[ticker]
-            time.sleep(2)
+            time.sleep(DELAI_REQUETE)
         except Exception as e:
             print(f"  ⚠️ {ticker} : {e}")
 
@@ -558,42 +533,47 @@ def gerer_scalp():
     except:
         return
 
-    for ticker, pos in list(scalp_positions.items()):
-        # Scalp fermé par Alpaca via TP/SL automatique
+    for key, pos in list(scalp_positions.items()):
+        ticker    = pos["ticker"]
+        direction = pos["direction"]
+
         if ticker not in positions_alpaca:
             print(f"  ✅ {ticker} scalp fermé (TP/SL Alpaca)")
-            del scalp_positions[ticker]
+            del scalp_positions[key]
             continue
 
         prix_actuel = float(positions_alpaca[ticker].current_price)
         entree      = pos["prix_entree"]
-        direction   = pos["direction"]
         gain_pct    = ((prix_actuel - entree) / entree) * 100
-        quantite    = int(float(positions_alpaca[ticker].qty))
-
         if direction == "SHORT":
             gain_pct = -gain_pct
+        quantite = int(float(positions_alpaca[ticker].qty))
 
         print(f"  ⚡ {ticker} {direction} | {entree:.2f}$→{prix_actuel:.2f}$ | {gain_pct:+.2f}%")
 
-        # Sortie scalp sur pattern opposé
-        pattern = detecter_pattern_meche(telecharger_donnees(ticker) or pd.DataFrame())
-        if direction == "LONG" and pattern in ["MARTEAU_INVERSE", "ETOILE_SOIR"]:
-            passer_vente(ticker, quantite, f"PATTERN_OPPOSE_{pattern}")
-            del scalp_positions[ticker]
-        elif direction == "SHORT" and pattern in ["MARTEAU", "ETOILE_MATIN"]:
-            # Rachat pour clore le short
-            try:
-                ordre = MarketOrderRequest(
-                    symbol=ticker, qty=quantite,
-                    side=OrderSide.BUY,
-                    time_in_force=TimeInForce.DAY
-                )
-                client.submit_order(ordre)
-                print(f"  ✅ SHORT {ticker} clôturé")
-            except Exception as e:
-                print(f"  ❌ {e}")
-            del scalp_positions[ticker]
+        # Sortie sur pattern opposé
+        try:
+            df = telecharger_donnees(ticker)
+            if df is not None:
+                pattern = detecter_pattern_meche(df)
+                if direction == "LONG" and pattern in ["MARTEAU_INVERSE", "ETOILE_SOIR"]:
+                    passer_vente(ticker, quantite, f"PATTERN_OPPOSE")
+                    del scalp_positions[key]
+                elif direction == "SHORT" and pattern in ["MARTEAU", "ETOILE_MATIN"]:
+                    try:
+                        ordre = MarketOrderRequest(
+                            symbol=ticker, qty=quantite,
+                            side=OrderSide.BUY,
+                            time_in_force=TimeInForce.DAY
+                        )
+                        client.submit_order(ordre)
+                        print(f"  ✅ SHORT {ticker} clôturé")
+                    except Exception as e:
+                        print(f"  ❌ {e}")
+                    del scalp_positions[key]
+            time.sleep(DELAI_REQUETE)
+        except Exception as e:
+            print(f"  ⚠️ {ticker} scalp : {e}")
 
 # ═══════════════════════════════════════════════════════════════
 #  HORAIRES
@@ -603,18 +583,6 @@ def get_heure():
     now   = datetime.now(TZ_PARIS)
     heure = now.hour + now.minute / 60
     return heure, now.strftime("%H:%M")
-
-def est_ouvert():
-    h, _ = get_heure()
-    return HEURE_OUVERTURE <= h < HEURE_FERMETURE
-
-def scalp_autorise():
-    h, _ = get_heure()
-    return HEURE_OUVERTURE <= h < HEURE_FIN_SCALP
-
-def fermeture_imminente():
-    h, _ = get_heure()
-    return h >= HEURE_FERMETURE
 
 # ═══════════════════════════════════════════════════════════════
 #  BOUCLE PRINCIPALE
@@ -626,10 +594,9 @@ def lancer_robot(pause_minutes=15):
     print(f"💰 Capital         : {CAPITAL_TOTAL:.2f}$")
     print(f"🥇 Actifs          : GLD | SGOL | USO")
     print(f"📈 TYPE 1 Swing    : max {MAX_LONG_SWING} LONG | 9h→21h | Belkhayat+RSI+MACD")
-    print(f"⚡ TYPE 2 Scalp    : max {MAX_SCALP} trades | 9h→17h | LONG+SHORT sur mèches ×3")
-    print(f"🕘 Fermeture forcée: 21h00 tous les jours")
-    print(f"🛑 SL Swing        : ATR ×{ATR_MULT_SWING}")
-    print(f"🛑 SL Scalp        : {SL_SCALP_PCT*100:.1f}% | TP Scalp : {TP_SCALP_PCT*100:.1f}%")
+    print(f"⚡ TYPE 2 Scalp    : max {MAX_SCALP} trades | 9h→17h | LONG+SHORT mèches ×3")
+    print(f"🕘 Fermeture forcée: 21h00")
+    print(f"🛑 SL Swing ATR    : ×{ATR_MULT_SWING} | SL Scalp: {SL_SCALP_PCT*100:.1f}% | TP: {TP_SCALP_PCT*100:.1f}%")
     print("=" * 60)
 
     fermeture_faite = False
@@ -642,22 +609,22 @@ def lancer_robot(pause_minutes=15):
         print(f"🔄 Cycle {cycle} | 🕐 {heure_str} Paris")
 
         # ── FERMETURE FORCÉE 21h00 ─────────────────────────────
-        if fermeture_imminente():
+        if h >= HEURE_FERMETURE:
             if not fermeture_faite:
                 fermeture_forcee_tout()
                 swing_positions.clear()
                 scalp_positions.clear()
                 fermeture_faite = True
-            print("🌙 Marché fermé jusqu'à 9h00")
+            print("🌙 Marché fermé — reprise à 9h00")
             time.sleep(pause_minutes * 60)
             continue
 
-        # Reset flag fermeture chaque matin
+        # Reset flag fermeture le matin
         if h >= HEURE_OUVERTURE:
             fermeture_faite = False
 
         # ── MARCHÉ FERMÉ ───────────────────────────────────────
-        if not est_ouvert():
+        if h < HEURE_OUVERTURE:
             print(f"⏳ Marché fermé — pause {pause_minutes}min")
             time.sleep(pause_minutes * 60)
             continue
@@ -667,28 +634,28 @@ def lancer_robot(pause_minutes=15):
             acc = client.get_account()
             print(f"💰 Cash: {float(acc.cash):.2f}$ | Portef: {float(acc.portfolio_value):.2f}$")
         except Exception as e:
-            print(f"  ⚠️ {e}")
+            print(f"  ⚠️ Compte : {e}")
 
-        # ── SYNC POSITIONS ALPACA ──────────────────────────────
+        # ── SYNC ALPACA ────────────────────────────────────────
         try:
             pos_reelles = {p.symbol for p in client.get_all_positions()}
             for t in list(swing_positions.keys()):
                 if t not in pos_reelles:
-                    print(f"  🛑 {t} swing — SL touché Alpaca")
+                    print(f"  🛑 {t} swing — fermée Alpaca")
                     del swing_positions[t]
-            for t in list(scalp_positions.keys()):
-                if t not in pos_reelles:
-                    print(f"  ✅ {t} scalp — TP/SL Alpaca")
-                    del scalp_positions[t]
+            for k in list(scalp_positions.keys()):
+                if scalp_positions[k]["ticker"] not in pos_reelles:
+                    print(f"  ✅ {scalp_positions[k]['ticker']} scalp — fermée Alpaca")
+                    del scalp_positions[k]
         except Exception as e:
             print(f"  ⚠️ Sync : {e}")
 
-        # ── GÉRER POSITIONS OUVERTES ───────────────────────────
+        # ── GÉRER POSITIONS ────────────────────────────────────
         gerer_swing()
-        if scalp_autorise():
+        if h < HEURE_FIN_SCALP:
             gerer_scalp()
 
-        # ── CHERCHER NOUVEAUX SIGNAUX SWING ───────────────────
+        # ── CHERCHER SIGNAUX SWING ─────────────────────────────
         places_swing = MAX_LONG_SWING - len(swing_positions)
         if places_swing > 0:
             print(f"\n📈 Recherche SWING ({places_swing} place(s))...")
@@ -706,9 +673,10 @@ def lancer_robot(pause_minutes=15):
                     if sig:
                         signaux.append(sig)
                         print(f"  🚨 SWING {ticker} — {sig['signal']} score {sig['score']}/6")
-                    time.sleep(3)
+                    time.sleep(DELAI_REQUETE)
                 except Exception as e:
-                    time.sleep(3)
+                    print(f"  ⚠️ {ticker} : {e}")
+                    time.sleep(DELAI_REQUETE)
 
             signaux.sort(key=lambda x: x["score"], reverse=True)
             for sig in signaux:
@@ -722,11 +690,11 @@ def lancer_robot(pause_minutes=15):
                         "order_id":    order_id,
                     }
 
-        # ── CHERCHER NOUVEAUX SIGNAUX SCALP ───────────────────
-        if scalp_autorise():
+        # ── CHERCHER SIGNAUX SCALP ─────────────────────────────
+        if h < HEURE_FIN_SCALP:
             places_scalp = MAX_SCALP - len(scalp_positions)
             if places_scalp > 0:
-                print(f"\n⚡ Recherche SCALP ({places_scalp} place(s)) — 9h→17h...")
+                print(f"\n⚡ Recherche SCALP ({places_scalp} place(s)) — jusqu'à 17h...")
                 try:
                     pos_reelles = {p.symbol for p in client.get_all_positions()}
                 except:
@@ -735,7 +703,6 @@ def lancer_robot(pause_minutes=15):
                 for ticker in actifs:
                     if len(scalp_positions) >= MAX_SCALP:
                         break
-                    # Un actif peut avoir 1 swing ET 1 scalp en même temps
                     scalp_key = f"{ticker}_scalp"
                     if scalp_key in scalp_positions:
                         continue
@@ -756,20 +723,21 @@ def lancer_robot(pause_minutes=15):
                                     "tp":          sig["tp"],
                                     "order_id":    order_id,
                                 }
-                        time.sleep(3)
+                        time.sleep(DELAI_REQUETE)
                     except Exception as e:
-                        time.sleep(3)
+                        print(f"  ⚠️ {ticker} scalp : {e}")
+                        time.sleep(DELAI_REQUETE)
             else:
                 print("⚡ Scalp plein (3/3)")
         else:
-            print("⏰ Scalp terminé pour aujourd'hui (après 17h)")
+            print("⏰ Scalp terminé (après 17h)")
 
         # ── RÉSUMÉ ─────────────────────────────────────────────
         print(f"\n📊 Swing: {len(swing_positions)}/{MAX_LONG_SWING} | Scalp: {len(scalp_positions)}/{MAX_SCALP}")
         for t, p in swing_positions.items():
-            print(f"   📈 SWING {t} | Entrée: {p['prix_entree']:.2f}$ | SL: {p['sl']:.2f}$")
+            print(f"   📈 {t} LONG | Entrée: {p['prix_entree']:.2f}$ | SL: {p['sl']:.2f}$")
         for k, p in scalp_positions.items():
-            print(f"   ⚡ SCALP {p['ticker']} {p['direction']} | Entrée: {p['prix_entree']:.2f}$ | TP: {p['tp']:.2f}$ | SL: {p['sl']:.2f}$")
+            print(f"   ⚡ {p['ticker']} {p['direction']} | Entrée: {p['prix_entree']:.2f}$ | TP: {p['tp']:.2f}$ | SL: {p['sl']:.2f}$")
 
         print(f"\n⏳ Prochain scan dans {pause_minutes}min...")
         time.sleep(pause_minutes * 60)
