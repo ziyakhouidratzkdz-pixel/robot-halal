@@ -13,7 +13,11 @@ from alpaca.trading.requests import (
 from alpaca.trading.enums import OrderSide, TimeInForce, OrderClass
 from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.requests import StockBarsRequest
-from alpaca.data.timeframe import TimeFrame
+from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
+
+TF_15MIN = TimeFrame(15, TimeFrameUnit.Minute)
+TF_5MIN  = TimeFrame(5,  TimeFrameUnit.Minute)
+TF_DAY   = TimeFrame(1,  TimeFrameUnit.Day)
 
 # ═══════════════════════════════════════════════════════════════
 #  CONNEXION ALPACA
@@ -113,13 +117,13 @@ def get_bars(ticker, timeframe, nb_barres=100):
         return None
 
 def get_bars_15min(ticker):
-    return get_bars(ticker, TimeFrame.Minute15, nb_barres=100)
+    return get_bars(ticker, TF_15MIN, nb_barres=100)
 
 def get_bars_5min(ticker):
-    return get_bars(ticker, TimeFrame.Minute5, nb_barres=60)
+    return get_bars(ticker, TF_5MIN, nb_barres=60)
 
 def get_bars_daily(ticker):
-    return get_bars(ticker, TimeFrame.Day, nb_barres=60)
+    return get_bars(ticker, TF_DAY, nb_barres=60)
 
 # ═══════════════════════════════════════════════════════════════
 #  CALCUL QUANTITÉ — MAX 5 LOTS GARANTI ✅
