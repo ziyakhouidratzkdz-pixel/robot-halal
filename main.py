@@ -15,10 +15,6 @@ from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.requests import StockBarsRequest
 from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
 
-TF_15MIN = TimeFrame(15, TimeFrameUnit.Minute)
-TF_5MIN  = TimeFrame(5,  TimeFrameUnit.Minute)
-TF_DAY   = TimeFrame(1,  TimeFrameUnit.Day)
-
 # ═══════════════════════════════════════════════════════════════
 #  CONNEXION ALPACA
 # ═══════════════════════════════════════════════════════════════
@@ -26,535 +22,398 @@ TF_DAY   = TimeFrame(1,  TimeFrameUnit.Day)
 API_KEY    = os.environ.get("ALPACA_API_KEY", "PK4XAYAVTANIMZK6YT5DDNXZXT")
 API_SECRET = os.environ.get("ALPACA_SECRET", "9iYFsPF1iv3mvVKDqA4dvF3w42RzGinyryixB8SxopsR")
 
-# Client trading
-client = TradingClient(API_KEY, API_SECRET, paper=True)
-
-# ✅ Client data Alpaca — pas de rate limit !
+client      = TradingClient(API_KEY, API_SECRET, paper=True)
 data_client = StockHistoricalDataClient(API_KEY, API_SECRET)
+account     = client.get_account()
 
-account = client.get_account()
 print("✅ Connexion Alpaca réussie !")
-print(f"💰 Capital disponible : {float(account.cash):.2f}$")
-print(f"📊 Valeur portefeuille : {float(account.portfolio_value):.2f}$")
+print(f"💰 Capital : {float(account.cash):.2f}$")
+print(f"📊 Portef  : {float(account.portfolio_value):.2f}$")
 
 # ═══════════════════════════════════════════════════════════════
-#  CONFIGURATION
+#  CONFIGURATION — INSPIRÉE DES MEILLEURS ROBOTS GOLD
 # ═══════════════════════════════════════════════════════════════
 
-CAPITAL_TOTAL        = float(account.cash)
-MAX_LOTS             = 5           # ✅ Maximum 5 actions par trade
-MAX_LONG_SWING       = 4           # Max 4 swing long
-MAX_SCALP            = 3           # Max 3 scalp/short simultanés
-ATR_MULT_SWING       = 1.5
-SL_SCALP_PCT         = 0.004       # SL scalp -0.4%
-TP_SCALP_PCT         = 0.008       # TP scalp +0.8%
-SL_SHORT_PCT         = 0.005       # SL short -0.5%
-TP_SHORT_PCT         = 0.010       # TP short +1.0%
-MECHE_MULTIPLICATEUR = 2           # Mèche ≥ 2x corps
-HEURE_OUVERTURE      = 9
-HEURE_FIN_SCALP      = 17
-HEURE_FERMETURE      = 21
-PAUSE_SWING_MIN      = 15
-PAUSE_SCALP_MIN      = 5
-TZ_PARIS             = pytz.timezone("Europe/Paris")
-TZ_NY                = pytz.timezone("America/New_York")
+CAPITAL_TOTAL    = float(account.cash)
+MAX_LOTS         = 5              # Max 5 actions par trade
+MAX_TRADES_JOUR  = 10             # Max 10 trades par jour
+PERTE_MAX_JOUR   = 0.03           # Stop si -3% du capital dans la journée
+TP_LONG_PCT      = 0.006          # TP long +0.6%
+SL_LONG_PCT      = 0.003          # SL long -0.3%
+TP_SHORT_PCT     = 0.006          # TP short +0.6%
+SL_SHORT_PCT     = 0.003          # SL short -0.3%
+HEURE_OUVERTURE  = 9              # 9h Paris
+HEURE_FERMETURE  = 21             # 21h Paris — fermeture forcée
+PAUSE_MIN        = 3              # Scan toutes les 3 minutes
+TZ_PARIS         = pytz.timezone("Europe/Paris")
+TZ_NY            = pytz.timezone("America/New_York")
+
+# Timeframes Alpaca
+TF_5MIN  = TimeFrame(5,  TimeFrameUnit.Minute)
+TF_1MIN  = TimeFrame(1,  TimeFrameUnit.Minute)
+TF_DAY   = TimeFrame(1,  TimeFrameUnit.Day)
 
 # ═══════════════════════════════════════════════════════════════
-#  3 ACTIFS HALAL
+#  ACTIFS HALAL — OR UNIQUEMENT (comme les meilleurs robots gold)
 # ═══════════════════════════════════════════════════════════════
 
 actifs = {
-    "GLD":  "Or (XAUUSD)",
-    "SGOL": "Or physique (GC)",
-    "USO":  "Pétrole (CL)",
+    "GLD":  "Or ETF 🥇",
+    "SGOL": "Or physique 🥇",
+    "USO":  "Pétrole 🛢️",
 }
 
 # ═══════════════════════════════════════════════════════════════
-#  TÉLÉCHARGEMENT VIA ALPACA DATA — ZÉRO RATE LIMIT ✅
+#  COMPTEURS JOURNALIERS
 # ═══════════════════════════════════════════════════════════════
 
-def get_bars(ticker, timeframe, nb_barres=100):
-    """
-    Récupère les bougies via Alpaca Data API
-    timeframe : TimeFrame.Minute5, TimeFrame.Minute15, TimeFrame.Day
-    """
-    try:
-        now_ny  = datetime.now(TZ_NY)
-        debut   = now_ny - timedelta(days=5)
+trades_jour      = 0
+pnl_jour         = 0.0
+date_courante    = None
 
-        request = StockBarsRequest(
+def reset_compteurs():
+    global trades_jour, pnl_jour, date_courante
+    today = datetime.now(TZ_PARIS).date()
+    if date_courante != today:
+        date_courante = today
+        trades_jour   = 0
+        pnl_jour      = 0.0
+        print(f"\n🔄 Nouveau jour — compteurs réinitialisés")
+
+# ═══════════════════════════════════════════════════════════════
+#  TÉLÉCHARGEMENT DONNÉES ALPACA
+# ═══════════════════════════════════════════════════════════════
+
+def get_bars(ticker, timeframe, nb=100):
+    try:
+        now_ny = datetime.now(TZ_NY)
+        debut  = now_ny - timedelta(days=5)
+        req    = StockBarsRequest(
             symbol_or_symbols=ticker,
             timeframe=timeframe,
             start=debut,
             end=now_ny,
-            limit=nb_barres
+            limit=nb
         )
-        bars = data_client.get_stock_bars(request)
+        bars = data_client.get_stock_bars(req)
         df   = bars.df
-
         if df is None or len(df) < 10:
             return None
-
-        # Flatten multi-index si nécessaire
         if isinstance(df.index, pd.MultiIndex):
             df = df.xs(ticker, level="symbol")
-
-        df = df.rename(columns={
-            "open":   "Open",
-            "high":   "High",
-            "low":    "Low",
-            "close":  "Close",
-            "volume": "Volume"
-        })
-
-        # Garder seulement les colonnes nécessaires
-        df = df[["Open", "High", "Low", "Close", "Volume"]].copy()
-        df = df.dropna()
+        df = df.rename(columns={"open":"Open","high":"High","low":"Low","close":"Close","volume":"Volume"})
+        df = df[["Open","High","Low","Close","Volume"]].dropna()
         return df
-
     except Exception as e:
-        print(f"  ⚠️ Alpaca Data {ticker} : {e}")
+        print(f"  ⚠️ Data {ticker} : {e}")
         return None
 
-def get_bars_15min(ticker):
-    return get_bars(ticker, TF_15MIN, nb_barres=100)
-
-def get_bars_5min(ticker):
-    return get_bars(ticker, TF_5MIN, nb_barres=60)
-
-def get_bars_daily(ticker):
-    return get_bars(ticker, TF_DAY, nb_barres=60)
-
 # ═══════════════════════════════════════════════════════════════
-#  CALCUL QUANTITÉ — MAX 5 LOTS GARANTI ✅
+#  INDICATEURS SIMPLES ET EFFICACES
+#  Inspiré des meilleurs robots gold : EMA + RSI + Bougies
 # ═══════════════════════════════════════════════════════════════
 
-def calculer_quantite(prix):
-    quantite = int((CAPITAL_TOTAL * 0.02) / prix)
-    return max(1, min(quantite, MAX_LOTS))
-
-# ═══════════════════════════════════════════════════════════════
-#  INDICATEURS 15MIN (SWING)
-# ═══════════════════════════════════════════════════════════════
-
-def indicateurs_15min(df):
-    # Stochastique (14,3)
-    lmin = df["Low"].rolling(14).min()
-    hmax = df["High"].rolling(14).max()
-    df["%K"] = 100 * (df["Close"] - lmin) / (hmax - lmin + 1e-9)
-    df["%D"] = df["%K"].rolling(3).mean()
-    # RSI (14)
-    d = df["Close"].diff()
-    df["RSI"] = 100 - (100 / (d.clip(lower=0).rolling(14).mean() /
-                               (-d.clip(upper=0)).rolling(14).mean() + 1e-9 + 1))
-    # MACD (12,26,9)
-    df["MACD"]     = df["Close"].ewm(span=12).mean() - df["Close"].ewm(span=26).mean()
-    df["MACD_SIG"] = df["MACD"].ewm(span=9).mean()
-    # EMA
-    df["EMA9"]  = df["Close"].ewm(span=9).mean()
-    df["EMA21"] = df["Close"].ewm(span=21).mean()
+def calcul_indicateurs(df):
+    # EMA rapides
+    df["EMA5"]  = df["Close"].ewm(span=5).mean()
+    df["EMA10"] = df["Close"].ewm(span=10).mean()
+    df["EMA20"] = df["Close"].ewm(span=20).mean()
     df["EMA50"] = df["Close"].ewm(span=50).mean()
-    # Bollinger (Belkhayat)
-    df["BB_MID"] = df["Close"].rolling(20).mean()
-    df["BB_STD"] = df["Close"].rolling(20).std()
-    df["BB_UP"]  = df["BB_MID"] + 2 * df["BB_STD"]
-    df["BB_LO"]  = df["BB_MID"] - 2 * df["BB_STD"]
-    # ATR (14)
-    df["TR"]  = pd.concat([
-        df["High"] - df["Low"],
-        (df["High"] - df["Close"].shift(1)).abs(),
-        (df["Low"]  - df["Close"].shift(1)).abs()
-    ], axis=1).max(axis=1)
-    df["ATR"] = df["TR"].rolling(14).mean()
-    return df
 
-# ═══════════════════════════════════════════════════════════════
-#  INDICATEURS 5MIN (SCALP) — RÉACTIFS
-# ═══════════════════════════════════════════════════════════════
+    # RSI rapide (7 périodes)
+    delta = df["Close"].diff()
+    gain  = delta.clip(lower=0).rolling(7).mean()
+    perte = (-delta.clip(upper=0)).rolling(7).mean()
+    df["RSI"] = 100 - (100 / (gain / (perte + 1e-9) + 1))
 
-def indicateurs_5min(df):
-    # RSI rapide (7)
-    d = df["Close"].diff()
-    df["RSI"] = 100 - (100 / (d.clip(lower=0).rolling(7).mean() /
-                               (-d.clip(upper=0)).rolling(7).mean() + 1e-9 + 1))
     # MACD rapide (5,13,4)
     df["MACD"]     = df["Close"].ewm(span=5).mean() - df["Close"].ewm(span=13).mean()
     df["MACD_SIG"] = df["MACD"].ewm(span=4).mean()
+
     # Stochastique rapide (5,3)
     lmin = df["Low"].rolling(5).min()
     hmax = df["High"].rolling(5).max()
     df["%K"] = 100 * (df["Close"] - lmin) / (hmax - lmin + 1e-9)
     df["%D"] = df["%K"].rolling(3).mean()
-    # EMA court
-    df["EMA9"]  = df["Close"].ewm(span=9).mean()
-    df["EMA21"] = df["Close"].ewm(span=21).mean()
-    # Bollinger (10)
-    df["BB_MID"] = df["Close"].rolling(10).mean()
-    df["BB_STD"] = df["Close"].rolling(10).std()
+
+    # Bollinger Bands (20)
+    df["BB_MID"] = df["Close"].rolling(20).mean()
+    df["BB_STD"] = df["Close"].rolling(20).std()
     df["BB_UP"]  = df["BB_MID"] + 2 * df["BB_STD"]
     df["BB_LO"]  = df["BB_MID"] - 2 * df["BB_STD"]
-    # ATR rapide (7)
-    df["TR"]  = pd.concat([
+
+    # ATR (7)
+    tr = pd.concat([
         df["High"] - df["Low"],
         (df["High"] - df["Close"].shift(1)).abs(),
         (df["Low"]  - df["Close"].shift(1)).abs()
     ], axis=1).max(axis=1)
-    df["ATR"] = df["TR"].rolling(7).mean()
+    df["ATR"] = tr.rolling(7).mean()
+
+    # Volume moyen
+    df["VOL_MOY"] = df["Volume"].rolling(20).mean()
+
     return df
 
 # ═══════════════════════════════════════════════════════════════
-#  DÉTECTION MÈCHES ×2
+#  DÉTECTION PATTERNS BOUGIES
 # ═══════════════════════════════════════════════════════════════
 
-def detecter_meche(df):
-    if df is None or len(df) < 3:
+def detecter_pattern(df):
+    if len(df) < 3:
         return None
+    d, d1, d2 = df.iloc[-1], df.iloc[-2], df.iloc[-3]
 
-    def analyse(row):
-        o, c = float(row["Open"]), float(row["Close"])
-        h, l = float(row["High"]), float(row["Low"])
+    def bougie(r):
+        o, c = float(r["Open"]), float(r["Close"])
+        h, l = float(r["High"]), float(r["Low"])
         corps = abs(c - o)
         if corps < 1e-9: corps = 1e-9
         return corps, h - max(o,c), min(o,c) - l, o, c
 
-    corps,   mh,  mb,  o,  c  = analyse(df.iloc[-1])
-    corps_1, mh1, mb1, o1, c1 = analyse(df.iloc[-2])
-    corps_2, mh2, mb2, o2, c2 = analyse(df.iloc[-3])
+    c0, mh0, mb0, o0, cl0 = bougie(d)
+    c1, mh1, mb1, o1, cl1 = bougie(d1)
+    c2, mh2, mb2, o2, cl2 = bougie(d2)
 
-    if mb >= MECHE_MULTIPLICATEUR * corps and mh < corps:
+    # Marteau → LONG (mèche basse ≥ 2× corps)
+    if mb0 >= 2 * c0 and mh0 < c0:
         return "MARTEAU"
-    if mh >= MECHE_MULTIPLICATEUR * corps and mb < corps:
-        return "MARTEAU_INVERSE"
-    if (c2 < o2 and corps_1 < corps_2*0.3 and c > o and c > (o2+c2)/2):
+    # Marteau inverse → SHORT (mèche haute ≥ 2× corps)
+    if mh0 >= 2 * c0 and mb0 < c0:
+        return "MARTEAU_INV"
+    # Engulfing haussier → LONG
+    if cl0 > o0 and cl1 < o1 and cl0 > o1 and o0 < cl1:
+        return "ENGULFING_HAUSSIER"
+    # Engulfing baissier → SHORT
+    if cl0 < o0 and cl1 > o1 and cl0 < o1 and o0 > cl1:
+        return "ENGULFING_BAISSIER"
+    # Étoile du matin → LONG
+    if cl2 < o2 and c1 < c2*0.3 and cl0 > o0 and cl0 > (o2+cl2)/2:
         return "ETOILE_MATIN"
-    if (c2 > o2 and corps_1 < corps_2*0.3 and c < o and c < (o2+c2)/2):
+    # Étoile du soir → SHORT
+    if cl2 > o2 and c1 < c2*0.3 and cl0 < o0 and cl0 < (o2+cl2)/2:
         return "ETOILE_SOIR"
+    # Doji → indécision
+    if c0 < (float(d["High"]) - float(d["Low"])) * 0.1:
+        return "DOJI"
     return None
 
-def calcul_tendance(ticker):
-    """Tendance via données daily Alpaca"""
-    try:
-        df = get_bars_daily(ticker)
-        if df is None or len(df) < 20:
-            return "NEUTRE"
-        df["MA20"] = df["Close"].rolling(20).mean()
-        close = float(df.iloc[-1]["Close"])
-        ma20  = float(df.iloc[-1]["MA20"])
-        if close > ma20 * 1.01:   return "HAUSSE"
-        elif close < ma20 * 0.99: return "BAISSE"
-        else:                     return "NEUTRE"
-    except:
-        return "NEUTRE"
-
 # ═══════════════════════════════════════════════════════════════
-#  TYPE 1 — SWING LONG 15MIN
+#  SIGNAL LONG — CONDITIONS SOUPLES MAIS CONFIRMÉES
 # ═══════════════════════════════════════════════════════════════
 
-def signal_swing_long(ticker):
-    df = get_bars_15min(ticker)
+def signal_long(ticker):
+    df = get_bars(ticker, TF_5MIN, nb=80)
     if df is None or len(df) < 30:
         return None
-    df = indicateurs_15min(df)
+    df = calcul_indicateurs(df)
 
     d, d1 = df.iloc[-1], df.iloc[-2]
-    prix  = float(d["Close"])
-    k, kp = float(d["%K"]), float(d1["%K"])
-    dv    = float(d["%D"])
-    rsi   = float(d["RSI"])
-    macd, msig = float(d["MACD"]), float(d["MACD_SIG"])
-    mp, sp     = float(d1["MACD"]), float(d1["MACD_SIG"])
-    atr        = float(d["ATR"])
-    bbl, bbm   = float(d["BB_LO"]), float(d["BB_MID"])
-    e9, e21    = float(d["EMA9"]),  float(d["EMA21"])
-    e9p, e21p  = float(d1["EMA9"]), float(d1["EMA21"])
+    prix   = float(d["Close"])
+    rsi    = float(d["RSI"])
+    k      = float(d["%K"])
+    kp     = float(d1["%K"])
+    macd   = float(d["MACD"])
+    msig   = float(d["MACD_SIG"])
+    mp     = float(d1["MACD"])
+    e5     = float(d["EMA5"])
+    e10    = float(d["EMA10"])
+    e20    = float(d["EMA20"])
+    e5p    = float(d1["EMA5"])
+    e10p   = float(d1["EMA10"])
+    bbl    = float(d["BB_LO"])
+    bbm    = float(d["BB_MID"])
+    vol    = float(d["Volume"])
+    volm   = float(d["VOL_MOY"])
+    pattern = detecter_pattern(df)
 
-    vol_moyen = df["Volume"].rolling(20).mean().iloc[-1]
-    vol_ok    = float(d["Volume"]) > vol_moyen
+    score = 0
+    raison = []
 
-    tendance    = calcul_tendance(ticker)
-    tendance_ok = tendance in ["HAUSSE", "NEUTRE"]
+    # ── CONDITIONS LONG (souples) ──────────────────────────────
 
-    sig, score = None, 0
+    # RSI survendu ou neutre
+    if rsi < 50:
+        score += 2
+        raison.append(f"RSI={rsi:.0f}")
 
-    # LONG A : Rebond zone basse Belkhayat
-    if prix <= bbl * 1.015 and k < 30 and dv < 35 and tendance_ok:
-        sig, score = "BELKHAYAT_REBOND", 3
-        if vol_ok: score+=1
-        if k > kp: score+=1
-        if rsi < 40: score+=1
+    # Stoch remonte
+    if k > kp and k < 70:
+        score += 2
+        raison.append(f"STOCH↑{k:.0f}")
 
-    # LONG B : Croisement MACD haussier
-    elif macd > msig and mp <= sp and rsi > 35 and rsi < 65 and tendance_ok:
-        sig, score = "MACD_HAUSSIER", 3
-        if vol_ok: score+=1
-        if prix < bbm: score+=1
-        if k < 60: score+=1
+    # MACD haussier
+    if macd > msig or macd > mp:
+        score += 2
+        raison.append("MACD↑")
 
-    # LONG C : RSI survendu
-    elif rsi < 35 and k > kp and k < 45 and tendance_ok and vol_ok:
-        sig, score = "RSI_SURVENDU", 3
-        if prix <= bbl*1.02: score+=1
-        if macd > mp: score+=1
-        if k > dv: score+=1
+    # EMA5 > EMA10 (tendance court terme haussière)
+    if e5 > e10:
+        score += 1
+        raison.append("EMA5>10")
 
-    # LONG D : Golden Cross EMA9/EMA21
-    elif e9 > e21 and e9p <= e21p and tendance_ok and rsi < 65:
-        sig, score = "EMA_GOLDEN_CROSS", 3
-        if vol_ok: score+=1
-        if rsi > 40: score+=1
-        if prix > bbm: score+=1
+    # Prix près de la bande basse ou sous moyenne
+    if prix <= bbl * 1.02 or prix < bbm:
+        score += 2
+        raison.append("BB_LO")
 
-    if sig is None or score < 4:
+    # Pattern bougie haussier
+    if pattern in ["MARTEAU", "ENGULFING_HAUSSIER", "ETOILE_MATIN"]:
+        score += 3
+        raison.append(f"📊{pattern}")
+
+    # Volume fort
+    if vol > volm * 0.8:
+        score += 1
+        raison.append("VOL✓")
+
+    # ── SEUIL : score ≥ 5 (très souple) ──────────────────────
+    if score < 5:
         return None
 
-    q = calculer_quantite(prix)
+    q = max(1, min(int((CAPITAL_TOTAL * 0.02) / prix), MAX_LOTS))
     return {
-        "ticker": ticker, "type": "SWING_LONG", "signal": sig,
-        "score": score, "prix": prix,
-        "sl": round(prix - (atr * ATR_MULT_SWING), 2),
-        "quantite": q, "capital": round(q * prix, 2),
+        "ticker":    ticker,
+        "direction": "LONG",
+        "signal":    " | ".join(raison),
+        "score":     score,
+        "prix":      prix,
+        "sl":        round(prix * (1 - SL_LONG_PCT), 2),
+        "tp":        round(prix * (1 + TP_LONG_PCT), 2),
+        "quantite":  q,
+        "capital":   round(q * prix, 2),
     }
 
 # ═══════════════════════════════════════════════════════════════
-#  TYPE 2 — SCALP LONG 5MIN
-# ═══════════════════════════════════════════════════════════════
-
-def signal_scalp_long(ticker):
-    df = get_bars_5min(ticker)
-    if df is None or len(df) < 20:
-        return None
-    df = indicateurs_5min(df)
-
-    pattern = detecter_meche(df)
-    if pattern not in ["MARTEAU", "ETOILE_MATIN"]:
-        return None
-
-    d, d1 = df.iloc[-1], df.iloc[-2]
-    prix  = float(d["Close"])
-    rsi   = float(d["RSI"])
-    macd  = float(d["MACD"])
-    mp    = float(d1["MACD"])
-    k     = float(d["%K"])
-    bbl   = float(d["BB_LO"])
-
-    score = 2
-    if rsi < 60:         score += 1
-    if macd >= mp:       score += 1
-    if k < 65:           score += 1
-    if prix <= bbl*1.02: score += 1
-
-    if score < 3:
-        return None
-
-    q = calculer_quantite(prix)
-    return {
-        "ticker": ticker, "type": "SCALP_LONG", "signal": pattern,
-        "direction": "LONG", "score": score, "prix": prix,
-        "sl": round(prix * (1 - SL_SCALP_PCT), 2),
-        "tp": round(prix * (1 + TP_SCALP_PCT), 2),
-        "quantite": q, "capital": round(q * prix, 2),
-    }
-
-# ═══════════════════════════════════════════════════════════════
-#  TYPE 3 — 7 SIGNAUX SHORT 5MIN 🔴
+#  SIGNAL SHORT — 7 CONDITIONS SOUPLES
 # ═══════════════════════════════════════════════════════════════
 
 def signal_short(ticker):
-    df = get_bars_5min(ticker)
-    if df is None or len(df) < 20:
-        return None
-    df = indicateurs_5min(df)
-
-    d, d1, d2 = df.iloc[-1], df.iloc[-2], df.iloc[-3]
-    prix  = float(d["Close"])
-    k, kp = float(d["%K"]), float(d1["%K"])
-    dv    = float(d["%D"])
-    rsi   = float(d["RSI"])
-    macd, msig = float(d["MACD"]), float(d["MACD_SIG"])
-    mp, sp     = float(d1["MACD"]), float(d1["MACD_SIG"])
-    bbu, bbm   = float(d["BB_UP"]), float(d["BB_MID"])
-    e9, e21    = float(d["EMA9"]),  float(d["EMA21"])
-    e9p, e21p  = float(d1["EMA9"]), float(d1["EMA21"])
-    rsi_prev   = float(d2["RSI"])
-
-    vol_moyen = df["Volume"].rolling(20).mean().iloc[-1]
-    vol_ok    = float(d["Volume"]) > vol_moyen
-
-    sig, score = None, 0
-
-    # SHORT 1 : Mèche haute ×2
-    pattern = detecter_meche(df)
-    if pattern in ["MARTEAU_INVERSE", "ETOILE_SOIR"]:
-        sig, score = f"MECHE_{pattern}", 3
-        if rsi > 55: score+=1
-        if macd <= mp: score+=1
-        if k > 60: score+=1
-        if vol_ok: score+=1
-
-    # SHORT 2 : Zone haute Belkhayat
-    elif prix >= bbu * 0.985 and k > 70 and rsi > 65:
-        sig, score = "ZONE_HAUTE_BELKHAYAT", 3
-        if k < kp: score+=1
-        if macd < msig: score+=1
-        if vol_ok: score+=1
-        if rsi > 70: score+=1
-
-    # SHORT 3 : MACD baissier 5min
-    elif macd < msig and mp >= sp and rsi > 50:
-        sig, score = "MACD_BAISSIER_5MIN", 3
-        if prix > bbm: score+=1
-        if k > 60: score+=1
-        if vol_ok: score+=1
-        if rsi > 55: score+=1
-
-    # SHORT 4 : RSI suracheté + stoch redescend
-    elif rsi > 70 and k < kp and k > 55:
-        sig, score = "RSI_SURACHETÉ_5MIN", 3
-        if prix >= bbu*0.97: score+=1
-        if macd < mp: score+=1
-        if vol_ok: score+=1
-        if dv > 70: score+=1
-
-    # SHORT 5 : EMA Death Cross 5min
-    elif e9 < e21 and e9p >= e21p and rsi > 45:
-        sig, score = "EMA_DEATH_CROSS_5MIN", 3
-        if prix < bbm: score+=1
-        if macd < msig: score+=1
-        if vol_ok: score+=1
-        if rsi > 50: score+=1
-
-    # SHORT 6 : Cassure sous EMA21
-    elif prix < e21 and float(d1["Close"]) >= e21p and k < 50 and vol_ok:
-        sig, score = "CASSURE_EMA21_5MIN", 3
-        if macd < msig: score+=1
-        if k < kp: score+=1
-        if rsi < 50: score+=1
-        if prix < bbm: score+=1
-
-    # SHORT 7 : Divergence baissière
-    elif prix > float(d2["Close"]) and rsi < rsi_prev and rsi > 55 and k > 60:
-        sig, score = "DIVERGENCE_BAISSIERE_5MIN", 3
-        if macd < mp: score+=1
-        if k < kp: score+=1
-        if prix > bbm: score+=1
-        if vol_ok: score+=1
-
-    if sig is None or score < 3:
-        return None
-
-    q = calculer_quantite(prix)
-    return {
-        "ticker": ticker, "type": "SHORT", "signal": sig,
-        "score": score, "direction": "SHORT", "prix": prix,
-        "sl": round(prix * (1 + SL_SHORT_PCT), 2),
-        "tp": round(prix * (1 - TP_SHORT_PCT), 2),
-        "quantite": q, "capital": round(q * prix, 2),
-    }
-
-# ═══════════════════════════════════════════════════════════════
-#  SIGNAL SORTIE SWING
-# ═══════════════════════════════════════════════════════════════
-
-def signal_sortie_swing(ticker, prix_entree):
-    df = get_bars_15min(ticker)
+    df = get_bars(ticker, TF_5MIN, nb=80)
     if df is None or len(df) < 30:
-        return False, None
-    df = indicateurs_15min(df)
+        return None
+    df = calcul_indicateurs(df)
 
     d, d1 = df.iloc[-1], df.iloc[-2]
-    prix  = float(d["Close"])
-    k, kp = float(d["%K"]), float(d1["%K"])
-    rsi   = float(d["RSI"])
-    macd, msig = float(d["MACD"]), float(d["MACD_SIG"])
-    mp, sp     = float(d1["MACD"]), float(d1["MACD_SIG"])
-    bbu        = float(d["BB_UP"])
-    e9, e21    = float(d["EMA9"]),  float(d["EMA21"])
-    e9p, e21p  = float(d1["EMA9"]), float(d1["EMA21"])
+    prix   = float(d["Close"])
+    rsi    = float(d["RSI"])
+    k      = float(d["%K"])
+    kp     = float(d1["%K"])
+    macd   = float(d["MACD"])
+    msig   = float(d["MACD_SIG"])
+    mp     = float(d1["MACD"])
+    e5     = float(d["EMA5"])
+    e10    = float(d["EMA10"])
+    e5p    = float(d1["EMA5"])
+    e10p   = float(d1["EMA10"])
+    bbu    = float(d["BB_UP"])
+    bbm    = float(d["BB_MID"])
+    vol    = float(d["Volume"])
+    volm   = float(d["VOL_MOY"])
+    pattern = detecter_pattern(df)
 
-    if prix < prix_entree:
-        return False, None
+    score = 0
+    raison = []
 
-    if prix >= bbu*0.985 and k > 70 and k < kp and rsi > 65:
-        return True, "ZONE_HAUTE_BELKHAYAT"
-    if macd < msig and mp >= sp and rsi > 50:
-        return True, "MACD_BAISSIER"
-    if rsi > 72 and k < kp:
-        return True, "RSI_SURACHETÉ"
-    if e9 < e21 and e9p >= e21p:
-        return True, "EMA_DEATH_CROSS"
+    # RSI suracheté ou élevé
+    if rsi > 50:
+        score += 2
+        raison.append(f"RSI={rsi:.0f}")
 
-    pattern = detecter_meche(df)
-    if pattern in ["MARTEAU_INVERSE", "ETOILE_SOIR"]:
-        return True, f"PATTERN_{pattern}"
+    # Stoch redescend
+    if k < kp and k > 30:
+        score += 2
+        raison.append(f"STOCH↓{k:.0f}")
 
-    return False, None
+    # MACD baissier
+    if macd < msig or macd < mp:
+        score += 2
+        raison.append("MACD↓")
+
+    # EMA5 < EMA10 (tendance court terme baissière)
+    if e5 < e10:
+        score += 1
+        raison.append("EMA5<10")
+
+    # Prix près de la bande haute ou au-dessus moyenne
+    if prix >= bbu * 0.98 or prix > bbm:
+        score += 2
+        raison.append("BB_UP")
+
+    # Pattern bougie baissier
+    if pattern in ["MARTEAU_INV", "ENGULFING_BAISSIER", "ETOILE_SOIR"]:
+        score += 3
+        raison.append(f"📊{pattern}")
+
+    # Volume fort
+    if vol > volm * 0.8:
+        score += 1
+        raison.append("VOL✓")
+
+    # ── SEUIL : score ≥ 5 ────────────────────────────────────
+    if score < 5:
+        return None
+
+    q = max(1, min(int((CAPITAL_TOTAL * 0.02) / prix), MAX_LOTS))
+    return {
+        "ticker":    ticker,
+        "direction": "SHORT",
+        "signal":    " | ".join(raison),
+        "score":     score,
+        "prix":      prix,
+        "sl":        round(prix * (1 + SL_SHORT_PCT), 2),
+        "tp":        round(prix * (1 - TP_SHORT_PCT), 2),
+        "quantite":  q,
+        "capital":   round(q * prix, 2),
+    }
 
 # ═══════════════════════════════════════════════════════════════
 #  ORDRES ALPACA
 # ═══════════════════════════════════════════════════════════════
 
-def passer_achat(signal):
+def passer_ordre(signal):
+    global trades_jour
     try:
-        ordre = MarketOrderRequest(
-            symbol=signal["ticker"], qty=signal["quantite"],
-            side=OrderSide.BUY, time_in_force=TimeInForce.DAY,
-            order_class=OrderClass.OTO,
-            stop_loss=StopLossRequest(stop_price=signal["sl"])
-        )
-        result = client.submit_order(ordre)
-        tp_str = f" TP:{signal['tp']:.2f}$" if "tp" in signal else ""
-        print(f"  ✅ LONG {signal['ticker']} | {signal['signal']}")
-        print(f"     {signal['quantite']}x{signal['prix']:.2f}$ | SL:{signal['sl']:.2f}${tp_str}")
-        return result.id
-    except Exception as e:
-        print(f"  ❌ Achat {signal['ticker']} : {e}")
-        try:
-            r = client.submit_order(MarketOrderRequest(
-                symbol=signal["ticker"], qty=signal["quantite"],
-                side=OrderSide.BUY, time_in_force=TimeInForce.DAY
-            ))
-            print(f"  ✅ LONG simple {signal['ticker']}")
-            return r.id
-        except Exception as e2:
-            print(f"  ❌ Échec : {e2}")
-            return None
+        if signal["direction"] == "LONG":
+            ordre = MarketOrderRequest(
+                symbol=signal["ticker"],
+                qty=signal["quantite"],
+                side=OrderSide.BUY,
+                time_in_force=TimeInForce.DAY,
+                order_class=OrderClass.BRACKET,
+                take_profit=TakeProfitRequest(limit_price=signal["tp"]),
+                stop_loss=StopLossRequest(stop_price=signal["sl"])
+            )
+        else:
+            ordre = MarketOrderRequest(
+                symbol=signal["ticker"],
+                qty=signal["quantite"],
+                side=OrderSide.SELL,
+                time_in_force=TimeInForce.DAY,
+                order_class=OrderClass.BRACKET,
+                take_profit=TakeProfitRequest(limit_price=signal["tp"]),
+                stop_loss=StopLossRequest(stop_price=signal["sl"])
+            )
 
-def passer_short(signal):
-    try:
-        ordre = MarketOrderRequest(
-            symbol=signal["ticker"], qty=signal["quantite"],
-            side=OrderSide.SELL, time_in_force=TimeInForce.DAY,
-            order_class=OrderClass.BRACKET,
-            take_profit=TakeProfitRequest(limit_price=signal["tp"]),
-            stop_loss=StopLossRequest(stop_price=signal["sl"])
-        )
         result = client.submit_order(ordre)
-        print(f"  🔴 SHORT {signal['ticker']} | {signal['signal']} | score {signal['score']}/7")
-        print(f"     {signal['quantite']}x{signal['prix']:.2f}$ | SL:{signal['sl']:.2f}$ TP:{signal['tp']:.2f}$")
+        trades_jour += 1
+        emoji = "🟢" if signal["direction"] == "LONG" else "🔴"
+        print(f"\n  {emoji} {signal['direction']} {signal['ticker']} | Score:{signal['score']}")
+        print(f"     {signal['quantite']}x{signal['prix']:.2f}$ | TP:{signal['tp']:.2f}$ SL:{signal['sl']:.2f}$")
+        print(f"     Signaux: {signal['signal']}")
+        print(f"     Trades aujourd'hui: {trades_jour}/{MAX_TRADES_JOUR}")
         return result.id
+
     except Exception as e:
-        print(f"  ❌ Short {signal['ticker']} : {e}")
+        print(f"  ❌ Ordre {signal['ticker']} : {e}")
         return None
 
-def passer_vente(ticker, quantite, raison):
-    try:
-        r = client.submit_order(MarketOrderRequest(
-            symbol=ticker, qty=quantite,
-            side=OrderSide.SELL, time_in_force=TimeInForce.DAY
-        ))
-        print(f"  ✅ VENTE {quantite}x{ticker} | {raison}")
-        return r.id
-    except Exception as e:
-        print(f"  ❌ Vente {ticker} : {e}")
-        return None
-
-def fermeture_forcee_tout():
-    """✅ Fermeture GARANTIE à 21h — toutes positions fermées"""
-    print("\n🔔 21h00 — FERMETURE FORCÉE TOUTES POSITIONS")
+def fermeture_forcee():
+    print("\n🔔 21h00 — FERMETURE FORCÉE")
     try:
         positions = client.get_all_positions()
         if not positions:
-            print("  ℹ️ Aucune position ouverte")
+            print("  ℹ️ Aucune position")
             return
         for pos in positions:
             try:
@@ -570,90 +429,39 @@ def fermeture_forcee_tout():
             except Exception as e:
                 print(f"  ❌ {pos.symbol} : {e}")
     except Exception as e:
-        print(f"  ❌ Erreur fermeture : {e}")
+        print(f"  ❌ {e}")
 
 # ═══════════════════════════════════════════════════════════════
-#  PORTEFEUILLES
+#  GESTION POSITIONS OUVERTES
 # ═══════════════════════════════════════════════════════════════
 
-swing_positions = {}
-scalp_positions = {}
+positions_robot = {}   # ticker → info
 
-def sync_alpaca():
+def sync_positions():
     try:
         reelles = {p.symbol for p in client.get_all_positions()}
-        for t in list(swing_positions.keys()):
+        for t in list(positions_robot.keys()):
             if t not in reelles:
-                print(f"  🛑 {t} swing fermée Alpaca")
-                del swing_positions[t]
-        for k in list(scalp_positions.keys()):
-            if scalp_positions[k]["ticker"] not in reelles:
-                print(f"  ✅ {scalp_positions[k]['ticker']} scalp/short fermée Alpaca")
-                del scalp_positions[k]
+                print(f"  ✅ {t} fermée (TP/SL Alpaca)")
+                del positions_robot[t]
     except Exception as e:
         print(f"  ⚠️ Sync : {e}")
 
-def gerer_swing():
-    if not swing_positions: return
-    print("\n📊 Swing :")
+def afficher_positions():
+    if not positions_robot:
+        return
     try:
         pa = {p.symbol: p for p in client.get_all_positions()}
-    except: return
-    for ticker, pos in list(swing_positions.items()):
-        if ticker not in pa:
-            print(f"  🛑 {ticker} SL Alpaca")
-            del swing_positions[ticker]; continue
-        prix_actuel = float(pa[ticker].current_price)
-        entree      = pos["prix_entree"]
-        gain        = ((prix_actuel - entree) / entree) * 100
-        q           = int(float(pa[ticker].qty))
-        print(f"  📌 {ticker} | {entree:.2f}$→{prix_actuel:.2f}$ | {gain:+.2f}%")
-        try:
-            sortir, raison = signal_sortie_swing(ticker, entree)
-            if sortir:
-                passer_vente(ticker, q, raison)
-                del swing_positions[ticker]
-        except Exception as e:
-            print(f"  ⚠️ {ticker} : {e}")
-
-def gerer_scalp():
-    if not scalp_positions: return
-    print("\n⚡ Scalp/Short :")
-    try:
-        pa = {p.symbol: p for p in client.get_all_positions()}
-    except: return
-    for key, pos in list(scalp_positions.items()):
-        ticker    = pos["ticker"]
-        direction = pos["direction"]
-        if ticker not in pa:
-            print(f"  ✅ {ticker} {direction} TP/SL Alpaca")
-            del scalp_positions[key]; continue
-        prix_actuel = float(pa[ticker].current_price)
-        entree      = pos["prix_entree"]
-        gain        = ((prix_actuel - entree) / entree) * 100
-        if direction == "SHORT": gain = -gain
-        q = int(float(pa[ticker].qty))
-        print(f"  ⚡ {ticker} {direction} | {entree:.2f}$→{prix_actuel:.2f}$ | {gain:+.2f}%")
-        try:
-            df = get_bars_5min(ticker)
-            if df is not None:
-                pattern = detecter_meche(df)
-                if direction == "LONG" and pattern in ["MARTEAU_INVERSE","ETOILE_SOIR"]:
-                    passer_vente(ticker, q, "PATTERN_OPPOSE")
-                    del scalp_positions[key]
-                elif direction == "SHORT" and pattern in ["MARTEAU","ETOILE_MATIN"]:
-                    try:
-                        client.submit_order(MarketOrderRequest(
-                            symbol=ticker, qty=q,
-                            side=OrderSide.BUY,
-                            time_in_force=TimeInForce.DAY
-                        ))
-                        print(f"  ✅ SHORT {ticker} clôturé")
-                    except Exception as e:
-                        print(f"  ❌ {e}")
-                    del scalp_positions[key]
-        except Exception as e:
-            print(f"  ⚠️ {ticker} : {e}")
+        for ticker, pos in positions_robot.items():
+            if ticker in pa:
+                prix_actuel = float(pa[ticker].current_price)
+                entree      = pos["prix_entree"]
+                gain        = ((prix_actuel - entree) / entree) * 100
+                if pos["direction"] == "SHORT":
+                    gain = -gain
+                print(f"   {'🟢' if pos['direction']=='LONG' else '🔴'} {ticker} | {entree:.2f}$→{prix_actuel:.2f}$ | {gain:+.2f}%")
+    except:
+        pass
 
 # ═══════════════════════════════════════════════════════════════
 #  HORAIRES
@@ -668,151 +476,129 @@ def get_heure():
 # ═══════════════════════════════════════════════════════════════
 
 def lancer_robot():
-    print("\n🤖 ROBOT HALAL V7 — ALPACA DATA — SWING 15MIN + SCALP 5MIN")
+    print("\n🤖 ROBOT HALAL V8 — INSPIRÉ DES MEILLEURS ROBOTS GOLD")
     print("=" * 65)
     print(f"💰 Capital          : {CAPITAL_TOTAL:.2f}$")
     print(f"🥇 Actifs           : GLD | SGOL | USO")
-    print(f"📈 Swing LONG       : max {MAX_LONG_SWING} | 15min | Belkhayat+MACD+RSI+EMA")
-    print(f"⚡ Scalp LONG       : mèches ×2 | 5min | TP+0.8% SL-0.4%")
-    print(f"🔴 SHORT            : 7 signaux | 5min | TP+1.0% SL-0.5%")
-    print(f"📦 Max lots/trade   : {MAX_LOTS} actions ✅")
-    print(f"🕘 Fermeture forcée : 21h00 ✅")
-    print(f"🚫 Yahoo Finance    : REMPLACÉ par Alpaca Data ✅")
+    print(f"🟢 LONG             : EMA + RSI + MACD + Bougies | Score ≥5")
+    print(f"🔴 SHORT            : EMA + RSI + MACD + Bougies | Score ≥5")
+    print(f"🎯 TP/SL            : +0.6% / -0.3% (serré comme les pros)")
+    print(f"📦 Max lots/trade   : {MAX_LOTS}")
+    print(f"📊 Max trades/jour  : {MAX_TRADES_JOUR}")
+    print(f"🛡️  Perte max/jour   : {PERTE_MAX_JOUR*100:.0f}%")
+    print(f"⏱️  Scan             : toutes les {PAUSE_MIN} minutes")
+    print(f"🕘 Fermeture forcée : 21h00")
     print("=" * 65)
 
     fermeture_faite = False
-    last_swing_scan = 0
-    cycle_scalp     = 0
+    cycle = 0
 
     while True:
         h, heure_str = get_heure()
 
-        # ── FERMETURE FORCÉE 21h00 ✅ ──────────────────────────
+        # ── FERMETURE 21h ──────────────────────────────────────
         if h >= HEURE_FERMETURE:
             if not fermeture_faite:
-                fermeture_forcee_tout()
-                swing_positions.clear()
-                scalp_positions.clear()
+                fermeture_forcee()
+                positions_robot.clear()
                 fermeture_faite = True
-                print("✅ Toutes positions fermées")
-            print(f"🌙 {heure_str} — En attente 9h00")
-            time.sleep(PAUSE_SCALP_MIN * 60)
+            print(f"🌙 {heure_str} — Fermeture 21h | Reprise 9h")
+            time.sleep(PAUSE_MIN * 60)
             continue
 
-        # Reset flag le matin
         if h >= HEURE_OUVERTURE:
             fermeture_faite = False
 
-        # Marché pas encore ouvert
         if h < HEURE_OUVERTURE:
             print(f"⏳ {heure_str} — Marché fermé")
-            time.sleep(PAUSE_SCALP_MIN * 60)
+            time.sleep(PAUSE_MIN * 60)
             continue
 
-        cycle_scalp += 1
-        now_ts = time.time()
-        print(f"\n{'='*65}")
-        print(f"⚡ Cycle {cycle_scalp} | 🕐 {heure_str} Paris")
+        cycle += 1
+        reset_compteurs()
 
+        print(f"\n{'='*65}")
+        print(f"🔄 Cycle {cycle} | 🕐 {heure_str} | Trades: {trades_jour}/{MAX_TRADES_JOUR}")
+
+        # ── INFO COMPTE ────────────────────────────────────────
         try:
             acc = client.get_account()
-            print(f"💰 Cash: {float(acc.cash):.2f}$ | Portef: {float(acc.portfolio_value):.2f}$")
-        except: pass
+            cash    = float(acc.cash)
+            portef  = float(acc.portfolio_value)
+            pnl_jour = portef - CAPITAL_TOTAL
+            print(f"💰 Cash:{cash:.2f}$ | Portef:{portef:.2f}$ | PnL jour:{pnl_jour:+.2f}$")
 
-        sync_alpaca()
+            # Stop si perte max journalière atteinte
+            if pnl_jour < -(CAPITAL_TOTAL * PERTE_MAX_JOUR):
+                print(f"🛑 PERTE MAX JOURNALIÈRE ATTEINTE ({pnl_jour:.2f}$) — Pause jusqu'à 21h")
+                fermeture_forcee()
+                positions_robot.clear()
+                time.sleep(PAUSE_MIN * 60)
+                continue
+        except Exception as e:
+            print(f"  ⚠️ Compte : {e}")
 
-        # ── SCALP + SHORT toutes les 5min ──────────────────────
-        if h < HEURE_FIN_SCALP:
-            gerer_scalp()
-            places = MAX_SCALP - len(scalp_positions)
-            if places > 0:
-                print(f"\n⚡🔴 Scan SCALP+SHORT ({places} place(s))...")
-                for ticker in actifs:
-                    if len(scalp_positions) >= MAX_SCALP: break
-                    short_key = f"{ticker}_short"
-                    scalp_key = f"{ticker}_scalp"
+        # ── SYNC POSITIONS ─────────────────────────────────────
+        sync_positions()
+        afficher_positions()
 
-                    # SHORT priorité
-                    if short_key not in scalp_positions:
-                        try:
-                            sig = signal_short(ticker)
-                            if sig:
-                                print(f"  🔴 {ticker} — {sig['signal']} score {sig['score']}/7")
-                                oid = passer_short(sig)
-                                if oid:
-                                    scalp_positions[short_key] = {
-                                        "ticker": ticker,
-                                        "prix_entree": sig["prix"],
-                                        "direction": "SHORT",
-                                        "sl": sig["sl"],
-                                        "tp": sig["tp"],
-                                        "order_id": oid,
-                                    }
-                        except Exception as e:
-                            print(f"  ⚠️ {ticker} short : {e}")
+        # ── CHERCHER SIGNAUX ───────────────────────────────────
+        if trades_jour < MAX_TRADES_JOUR:
+            print(f"\n🔍 Scan signaux...")
 
-                    # SCALP LONG
-                    if scalp_key not in scalp_positions and len(scalp_positions) < MAX_SCALP:
-                        try:
-                            sig = signal_scalp_long(ticker)
-                            if sig:
-                                print(f"  🟢 {ticker} — {sig['signal']} score {sig['score']}")
-                                oid = passer_achat(sig)
-                                if oid:
-                                    scalp_positions[scalp_key] = {
-                                        "ticker": ticker,
-                                        "prix_entree": sig["prix"],
-                                        "direction": "LONG",
-                                        "sl": sig["sl"],
-                                        "tp": sig["tp"],
-                                        "order_id": oid,
-                                    }
-                        except Exception as e:
-                            print(f"  ⚠️ {ticker} scalp : {e}")
-            else:
-                print("⚡ Scalp/Short plein (3/3)")
+            try:
+                pos_reelles = {p.symbol for p in client.get_all_positions()}
+            except:
+                pos_reelles = set()
+
+            for ticker in actifs:
+                # Max 1 position par actif à la fois
+                if ticker in pos_reelles:
+                    continue
+
+                # Cherche LONG
+                try:
+                    sig = signal_long(ticker)
+                    if sig:
+                        print(f"  🟢 LONG {ticker} score {sig['score']}")
+                        oid = passer_ordre(sig)
+                        if oid:
+                            positions_robot[ticker] = {
+                                "direction":   "LONG",
+                                "prix_entree": sig["prix"],
+                                "order_id":    oid,
+                            }
+                        continue  # pas de short si long trouvé
+                except Exception as e:
+                    print(f"  ⚠️ {ticker} long : {e}")
+
+                # Cherche SHORT
+                try:
+                    sig = signal_short(ticker)
+                    if sig:
+                        print(f"  🔴 SHORT {ticker} score {sig['score']}")
+                        oid = passer_ordre(sig)
+                        if oid:
+                            positions_robot[ticker] = {
+                                "direction":   "SHORT",
+                                "prix_entree": sig["prix"],
+                                "order_id":    oid,
+                            }
+                except Exception as e:
+                    print(f"  ⚠️ {ticker} short : {e}")
+
+                time.sleep(1)
+
         else:
-            print("⏰ Scalp/Short terminé (après 17h)")
-
-        # ── SWING LONG toutes les 15min ────────────────────────
-        if now_ts - last_swing_scan >= PAUSE_SWING_MIN * 60:
-            last_swing_scan = now_ts
-            gerer_swing()
-            places_sw = MAX_LONG_SWING - len(swing_positions)
-            if places_sw > 0:
-                print(f"\n📈 Scan SWING 15min ({places_sw} place(s))...")
-                signaux = []
-                for ticker in actifs:
-                    if ticker in swing_positions: continue
-                    try:
-                        sig = signal_swing_long(ticker)
-                        if sig:
-                            signaux.append(sig)
-                            print(f"  🚨 SWING {ticker} — {sig['signal']} score {sig['score']}/6")
-                    except Exception as e:
-                        print(f"  ⚠️ {ticker} swing : {e}")
-
-                signaux.sort(key=lambda x: x["score"], reverse=True)
-                for sig in signaux:
-                    if len(swing_positions) >= MAX_LONG_SWING: break
-                    oid = passer_achat(sig)
-                    if oid:
-                        swing_positions[sig["ticker"]] = {
-                            "prix_entree": sig["prix"],
-                            "sl": sig["sl"],
-                            "order_id": oid,
-                        }
+            print(f"📦 Max trades jour atteint ({MAX_TRADES_JOUR})")
 
         # ── RÉSUMÉ ─────────────────────────────────────────────
-        print(f"\n📊 Swing:{len(swing_positions)}/{MAX_LONG_SWING} | Scalp/Short:{len(scalp_positions)}/{MAX_SCALP}")
-        for t, p in swing_positions.items():
-            print(f"   📈 {t} | {p['prix_entree']:.2f}$ SL:{p['sl']:.2f}$")
-        for k, p in scalp_positions.items():
-            e = "🔴" if p["direction"]=="SHORT" else "🟢"
-            print(f"   {e} {p['direction']} {p['ticker']} | {p['prix_entree']:.2f}$ TP:{p['tp']:.2f}$ SL:{p['sl']:.2f}$")
+        print(f"\n📊 Positions: {len(positions_robot)} | Trades jour: {trades_jour}/{MAX_TRADES_JOUR}")
+        for t, p in positions_robot.items():
+            print(f"   {'🟢' if p['direction']=='LONG' else '🔴'} {t} | {p['direction']} | {p['prix_entree']:.2f}$")
 
-        print(f"\n⏳ Prochain scan dans {PAUSE_SCALP_MIN}min...")
-        time.sleep(PAUSE_SCALP_MIN * 60)
+        print(f"\n⏳ Prochain scan dans {PAUSE_MIN}min...")
+        time.sleep(PAUSE_MIN * 60)
 
 # LANCEMENT
 lancer_robot()
